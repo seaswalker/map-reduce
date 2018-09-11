@@ -1,6 +1,13 @@
 package mapreduce
 
-import "fmt"
+import (
+	"bufio"
+	"encoding/json"
+	"log"
+	"os"
+	"sort"
+	"strings"
+)
 
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
@@ -47,7 +54,86 @@ func doReduce(
 	// Your code here (Part I).
 	//
 
-	intermediateFileName := reduceName(jobName, nMap, reduceTask)
+	reduced := make(map[string][]string)
 
-	fmt.Printf("中间文件名: %s.\n", intermediateFileName)
+	for i := 0; i < nMap; i++ {
+		intermediateReduceFileName := reduceName(jobName, i, reduceTask)
+
+		err := handleOneIntermediateReduceFile(intermediateReduceFileName, reduced)
+		if err != nil {
+			log.Printf("Reduce中间文件打开失败，文件名: %s，error: %s.\n", intermediateReduceFileName, err)
+		}
+	}
+
+	sortAllValues(reduced)
+
+	result := callDoReduce(reduced, reduceF)
+
+	writeToReducedFile(result, outFile)
+
+	log.Printf("写入到reduce文件完成，文件名: %s.\n", outFile)
+}
+
+// 读取一个临时文件
+func handleOneIntermediateReduceFile(fileName string, reduced map[string][]string) (error) {
+	fi, err := os.Open(fileName)
+	if err != nil {
+		return err
+	}
+
+	defer fi.Close()
+
+	scanner := bufio.NewScanner(fi)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		parts := strings.Split(line, "=")
+		values, ok := reduced[parts[0]]
+
+		if !ok {
+			values := []string{parts[1]}
+			reduced[parts[0]] = values
+		} else {
+			values = append(values, parts[1])
+		}
+	}
+
+	return nil
+}
+
+// 对每个key的所有value进行排序
+func sortAllValues(reduced map[string][]string) {
+	for _, value := range reduced {
+		sort.Slice(value, func(i, j int) bool {
+			return strings.Compare(value[i], value[j]) > 0
+		})
+	}
+}
+
+func callDoReduce(reduced map[string][]string, reduceF func(key string, values []string) string) (map[string]string) {
+	result := make(map[string]string)
+
+	for key, value := range reduced {
+		userReduced := reduceF(key, value)
+		result[key] = userReduced
+	}
+
+	return result
+}
+
+func writeToReducedFile(result map[string]string, outFile string) {
+	fi, err := os.Create(outFile)
+
+	if err != nil {
+		log.Panicf("创建reduce文件失败，文件名: %s，错误码: %s\n.", outFile, err)
+	}
+
+	defer fi.Close()
+
+	enc := json.NewEncoder(fi)
+
+	for key, value := range result {
+		enc.Encode(KeyValue{key, value})
+	}
 }
