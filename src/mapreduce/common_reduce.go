@@ -1,5 +1,7 @@
 package mapreduce
 
+import "fmt"
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +46,8 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	intermediateFileName := reduceName(jobName, nMap, reduceTask)
+
+	fmt.Printf("中间文件名: %s.\n", intermediateFileName)
 }

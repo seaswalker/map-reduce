@@ -1,7 +1,10 @@
 package mapreduce
 
 import (
+	"bufio"
+	"fmt"
 	"hash/fnv"
+	"os"
 )
 
 func doMap(
@@ -53,6 +56,82 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+	// 读取给定的文件
+	fi, err := os.Open(inFile)
+	if err != nil {
+		fmt.Printf("Error: %s.", err)
+	}
+
+	defer fi.Close()
+
+	scanner := bufio.NewScanner(fi)
+
+	reduceFileCache := make(map[string]*os.File)
+	// 打开的reduce文件缓存
+	defer closeReduceFileCache(reduceFileCache)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		pair := mapF(inFile, line)
+
+		handlePairsForOneLine(pair, nReduce, jobName, mapTask, reduceFileCache)
+	}
+}
+
+func handlePairsForOneLine(pairs []KeyValue, nReduce int, jobName string, mapTask int, reduceFileCache map[string]*os.File) error {
+	for _, pair := range pairs {
+		r := ihash(pair.Key) % nReduce
+
+		reduceFileName := reduceName(jobName, mapTask, r)
+
+		target, err := openReduceFile(reduceFileName, reduceFileCache)
+
+		if err != nil {
+			return err
+		}
+
+		// 假定reduce的格式是key=value，一个reduce文件中可能有多个不同的key存在
+		line := pair.Key + "=" + pair.Value + "\n"
+		target.WriteString(line)
+	}
+
+	return nil
+}
+
+func openReduceFile(reduceFileName string, reduceFileCache map[string]*os.File) (*os.File, error) {
+	target := reduceFileCache[reduceFileName]
+
+	if target != nil {
+		return target, nil
+	}
+
+	fi, err := os.Open(reduceFileName)
+
+	if err == nil {
+		reduceFileCache[reduceFileName] = fi
+		return fi, nil
+	}
+
+	if os.IsNotExist(err) {
+		fmt.Printf("Reduce中间文件: %s不存在，创建之.\n", reduceFileName)
+		fi, err = os.Create(reduceFileName)
+
+		if err == nil {
+			reduceFileCache[reduceFileName] = fi
+			return fi, nil
+		}
+	}
+
+	fmt.Printf("Reduce中间文件: %s创建失败，错误码: %s，退出.\n", reduceFileName, err)
+	return nil, err
+}
+
+// 关闭reduce中间文件缓存
+func closeReduceFileCache(reduceFileCache map[string]*os.File) {
+	for _, value := range reduceFileCache {
+		value.Close()
+	}
 }
 
 func ihash(s string) int {
