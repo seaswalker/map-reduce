@@ -89,14 +89,16 @@ func handleOneIntermediateReduceFile(fileName string, reduced map[string][]strin
 		line := scanner.Text()
 
 		parts := strings.Split(line, "=")
+		var values []string
 		values, ok := reduced[parts[0]]
 
 		if !ok {
-			values := []string{parts[1]}
-			reduced[parts[0]] = values
+			values = []string{parts[1]}
 		} else {
+			// 每次append操作都返回一个新的slice对象
 			values = append(values, parts[1])
 		}
+		reduced[parts[0]] = values
 	}
 
 	return nil

@@ -1,10 +1,12 @@
 package mapreduce
 
 import (
-	"bufio"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
 	"os"
+	"path/filepath"
 )
 
 func doMap(
@@ -56,30 +58,34 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
-	// 读取给定的文件
+	// Read the given file
 	fi, err := os.Open(inFile)
 	if err != nil {
-		fmt.Printf("Error: %s.", err)
+		absolutePath, _ := filepath.Abs(filepath.Dir(inFile))
+		fmt.Printf("Error: %s, absolute file path: %s.\n", err, absolutePath)
+		return
 	}
 
 	defer fi.Close()
-
-	scanner := bufio.NewScanner(fi)
 
 	reduceFileCache := make(map[string]*os.File)
 	// 打开的reduce文件缓存
 	defer closeReduceFileCache(reduceFileCache)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		pair := mapF(inFile, line)
-
-		handlePairsForOneLine(pair, nReduce, jobName, mapTask, reduceFileCache)
+	data, err := ioutil.ReadAll(fi)
+	if err != nil {
+		log.Panicf("读取目标文件失败，error: %s.\n", err)
+		return
 	}
+
+	content := string(data)
+
+	pair := mapF(inFile, content)
+
+	handleMappedPairs(pair, nReduce, jobName, mapTask, reduceFileCache)
 }
 
-func handlePairsForOneLine(pairs []KeyValue, nReduce int, jobName string, mapTask int, reduceFileCache map[string]*os.File) error {
+func handleMappedPairs(pairs []KeyValue, nReduce int, jobName string, mapTask int, reduceFileCache map[string]*os.File) error {
 	for _, pair := range pairs {
 		r := ihash(pair.Key) % nReduce
 
@@ -106,7 +112,7 @@ func openReduceFile(reduceFileName string, reduceFileCache map[string]*os.File) 
 		return target, nil
 	}
 
-	fi, err := os.Open(reduceFileName)
+	fi, err := os.OpenFile(reduceFileName, os.O_WRONLY | os.O_APPEND, 0666)
 
 	if err == nil {
 		reduceFileCache[reduceFileName] = fi
