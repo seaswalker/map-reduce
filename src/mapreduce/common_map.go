@@ -120,7 +120,6 @@ func openReduceFile(reduceFileName string, reduceFileCache map[string]*os.File) 
 	}
 
 	if os.IsNotExist(err) {
-		fmt.Printf("Reduce中间文件: %s不存在，创建之.\n", reduceFileName)
 		fi, err = os.Create(reduceFileName)
 
 		if err == nil {

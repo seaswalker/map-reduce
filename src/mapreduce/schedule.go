@@ -1,8 +1,8 @@
 package mapreduce
 
 import (
-	"fmt"
-	"sync"
+    "fmt"
+    "sync"
 )
 
 //
@@ -15,50 +15,57 @@ import (
 // existing registered workers (if any) and new ones as they register.
 //
 func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, registerChan chan string) {
-	var ntasks int
-	var n_other int // number of inputs (for reduce) or outputs (for map)
-	switch phase {
-	case mapPhase:
-		ntasks = len(mapFiles)
-		n_other = nReduce
-	case reducePhase:
-		ntasks = nReduce
-		n_other = len(mapFiles)
-	}
+    var ntasks int
+    var n_other int // number of inputs (for reduce) or outputs (for map)
+    switch phase {
+    case mapPhase:
+        ntasks = len(mapFiles)
+        n_other = nReduce
+    case reducePhase:
+        ntasks = nReduce
+        n_other = len(mapFiles)
+    }
 
-	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
+    fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
 
-	// All ntasks tasks have to be scheduled on workers. Once all tasks
-	// have completed successfully, schedule() should return.
-	//
-	// Your code here (Part III, Part IV).
-	//
+    // All ntasks tasks have to be scheduled on workers. Once all tasks
+    // have completed successfully, schedule() should return.
+    //
+    // Your code here (Part III, Part IV).
+    //
 
-	latch := sync.WaitGroup{}
+    latch := sync.WaitGroup{}
 
-	for i := 0; i < ntasks; i++ {
-		// may be blocked here
-		worker := <- registerChan
+    for i := 0; i < ntasks; i++ {
+        file := ""
+        if phase == mapPhase {
+            file = mapFiles[i]
+        }
 
-		latch.Add(1)
+        args := DoTaskArgs{JobName: jobName, File: file, Phase: phase, TaskNumber: i, NumOtherPhase: n_other}
 
-		file := ""
-		if phase == mapPhase {
-			file = mapFiles[i]
-		}
+        dispatchWork(args, registerChan, &latch)
+    }
 
-		args := DoTaskArgs{JobName: jobName, File: file, Phase: phase, TaskNumber:i, NumOtherPhase:n_other}
+    latch.Wait()
 
-		go func() {
-			defer latch.Done()
-			// do not care about the return value now
-			call(worker, "Worker.DoTask", args, nil)
-			// release worker
-			go func() {registerChan <- worker}()
-		}()
-	}
+    fmt.Printf("Schedule: %v done\n", phase)
+}
 
-	latch.Wait()
+func dispatchWork(args DoTaskArgs, registerChan chan string, latch *sync.WaitGroup) {
+    // may be blocked here
+    worker := <-registerChan
+    latch.Add(1)
 
-	fmt.Printf("Schedule: %v done\n", phase)
+    go func() {
+        defer latch.Done()
+        ok := call(worker, "Worker.DoTask", args, nil)
+        if ok {
+            // release worker
+            go func() { registerChan <- worker }()
+        } else {
+            // retry
+            dispatchWork(args, registerChan, latch)
+        }
+    }()
 }
