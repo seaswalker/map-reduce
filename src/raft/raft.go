@@ -214,6 +214,7 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+// TODO called in config.go, 205
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -222,6 +223,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+
+	// 1. 启动RPC服务，监听给定的端口
+	// 2. 启动时的状态为follower
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
