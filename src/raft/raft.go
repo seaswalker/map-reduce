@@ -226,6 +226,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// 1. 启动RPC服务，监听给定的端口
 	// 2. 启动时的状态为follower
+	net := labrpc.MakeNetwork()
+	service := labrpc.MakeService(Raft{})
+	server := labrpc.MakeServer()
+	server.AddService(service)
+
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
