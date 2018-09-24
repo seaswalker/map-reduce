@@ -17,7 +17,12 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+    "log"
+    "math/rand"
+    "sync"
+    "time"
+)
 import "labrpc"
 
 // import "bytes"
@@ -55,6 +60,12 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	currentTerm int
+	votedFor int
+	// 当前Server选取过期时间(毫秒)
+	electionTimeout int
+	// 最后一次接收到leader心跳时间(毫秒数)
+	lastLeaderTime int64
 }
 
 // return currentTerm and whether this server
@@ -116,6 +127,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term int
+	candidateId int
+	lastLogIndex int
+	lastLogTerm int
 }
 
 //
@@ -124,6 +139,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term int
+	voteGranted bool
 }
 
 //
@@ -214,7 +231,6 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-// TODO called in config.go, 205
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -224,17 +240,60 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
-	// 1. 启动RPC服务，监听给定的端口
-	// 2. 启动时的状态为follower
-	net := labrpc.MakeNetwork()
-	service := labrpc.MakeService(Raft{})
-	server := labrpc.MakeServer()
-	server.AddService(service)
-
+	initRaft(rf)
+	startServer(peers[me])
+    startElectIfNecessary(rf)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 
 	return rf
+}
+
+// 对raft进行一些自定义的初始化工作
+func initRaft(raft *Raft) {
+    raft.currentTerm = 0
+
+    now := time.Now()
+
+    raft.lastLeaderTime = now.Unix()
+    // 选取超时时间的范围为250-350ms
+    rand.Seed(now.UnixNano())
+    raft.electionTimeout = 250 + rand.Intn(101)
+}
+
+func startServer(peer *labrpc.ClientEnd) {
+    net := labrpc.MakeNetwork()
+    service := labrpc.MakeService(Raft{})
+    server := labrpc.MakeServer()
+    server.AddService(service)
+    net.AddServer(peer, server)
+}
+
+func startElectIfNecessary(raft *Raft) {
+    // 每400毫秒执行一次，此时间间隔应该比选举时间超时时间(最大350ms)略长
+    d := time.Duration(time.Millisecond * 400)
+
+    ticker := time.NewTicker(d)
+
+    defer ticker.Stop()
+
+    go func() {
+        for t := range ticker.C {
+            if t.Unix() - raft.lastLeaderTime > 350 {
+                log.Printf(
+                    "上一次收到leader信息时间: %d，当前时间: %d，启动选举，当前term: %d，server id: %d.\n",
+                    raft.lastLeaderTime, t.Unix(), raft.currentTerm, raft.me,
+                )
+                go elect(raft)
+            }
+        }
+    }()
+}
+
+func elect(raft *Raft) {
+    // 向所有的其它服务器广播选举请求
+    for remote := range raft.peers {
+    }
 }
