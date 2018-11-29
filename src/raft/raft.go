@@ -28,8 +28,6 @@ import "labrpc"
 // import "bytes"
 // import "labgob"
 
-
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -42,42 +40,49 @@ import "labrpc"
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
 type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
+    CommandValid bool
+    Command      interface{}
+    CommandIndex int
 }
+
+// 服务器状态/角色
+const (
+    FOLLOWER = iota
+    CANDIDATE
+    LEADER
+)
 
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+    mu        sync.Mutex          // Lock to protect shared access to this peer's state
+    peers     []*labrpc.ClientEnd // RPC end points of all peers
+    persister *Persister          // Object to hold this peer's persisted state
+    me        int                 // this peer's index into peers[]
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+    // Your data here (2A, 2B, 2C).
+    // Look at the paper's Figure 2 for a description of what
+    // state a Raft server must maintain.
 
-	currentTerm int
-	votedFor int
-	// 当前Server选取过期时间(毫秒)
-	electionTimeout int
-	// 最后一次接收到leader心跳时间(毫秒数)
-	lastLeaderTime int64
+    currentTerm int
+    votedFor    map[int]bool
+    state       int
+    // 当前Server选取过期时间(毫秒)
+    electionTimeout int
+    // 最后一次接收到leader心跳时间(毫秒数)
+    lastLeaderTime int64
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+    var term int
+    var isleader bool
+    // Your code here (2A).
+    return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -85,52 +90,48 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+    // Your code here (2C).
+    // Example:
+    // w := new(bytes.Buffer)
+    // e := labgob.NewEncoder(w)
+    // e.Encode(rf.xxx)
+    // e.Encode(rf.yyy)
+    // data := w.Bytes()
+    // rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+    if data == nil || len(data) < 1 { // bootstrap without any state?
+        return
+    }
+    // Your code here (2C).
+    // Example:
+    // r := bytes.NewBuffer(data)
+    // d := labgob.NewDecoder(r)
+    // var xxx
+    // var yyy
+    // if d.Decode(&xxx) != nil ||
+    //    d.Decode(&yyy) != nil {
+    //   error...
+    // } else {
+    //   rf.xxx = xxx
+    //   rf.yyy = yyy
+    // }
 }
-
-
-
 
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	term int
-	candidateId int
-	lastLogIndex int
-	lastLogTerm int
+    // Your data here (2A, 2B).
+    term         int
+    candidateId  int
+    lastLogIndex int
+    lastLogTerm  int
 }
 
 //
@@ -138,16 +139,16 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
-	term int
-	voteGranted bool
+    // Your data here (2A).
+    term        int
+    voteGranted bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+    // Your code here (2A, 2B).
 }
 
 //
@@ -180,10 +181,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+    ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+    return ok
 }
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -200,14 +200,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+    index := -1
+    term := -1
+    isLeader := true
 
-	// Your code here (2B).
+    // Your code here (2B).
 
-
-	return index, term, isLeader
+    return index, term, isLeader
 }
 
 //
@@ -217,7 +216,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // turn off debug output from this instance.
 //
 func (rf *Raft) Kill() {
-	// Your code here, if desired.
+    // Your code here, if desired.
 }
 
 //
@@ -232,29 +231,28 @@ func (rf *Raft) Kill() {
 // for any long-running work.
 //
 func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+    persister *Persister, applyCh chan ApplyMsg) *Raft {
+    rf := &Raft{}
+    rf.peers = peers
+    rf.persister = persister
+    rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
+    // Your initialization code here (2A, 2B, 2C).
 
-	initRaft(rf)
-	startServer(peers[me])
+    initRaft(rf)
+    startServer(peers[me])
     startElectIfNecessary(rf)
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+    // initialize from state persisted before a crash
+    rf.readPersist(persister.ReadRaftState())
 
-
-	return rf
+    return rf
 }
 
 // 对raft进行一些自定义的初始化工作
 func initRaft(raft *Raft) {
     raft.currentTerm = 0
-
+    raft.state = FOLLOWER
     now := time.Now()
 
     raft.lastLeaderTime = now.Unix()
@@ -281,7 +279,7 @@ func startElectIfNecessary(raft *Raft) {
 
     go func() {
         for t := range ticker.C {
-            if t.Unix() - raft.lastLeaderTime > 350 {
+            if t.Unix()-raft.lastLeaderTime > 350 {
                 log.Printf(
                     "上一次收到leader信息时间: %d，当前时间: %d，启动选举，当前term: %d，server id: %d.\n",
                     raft.lastLeaderTime, t.Unix(), raft.currentTerm, raft.me,
@@ -294,6 +292,64 @@ func startElectIfNecessary(raft *Raft) {
 
 func elect(raft *Raft) {
     // 向所有的其它服务器广播选举请求
-    for remote := range raft.peers {
+    for index := range raft.peers {
+        voteArgs := RequestVoteArgs{term: raft.currentTerm, candidateId: index}
+        voteReply := RequestVoteReply{}
+
+        go func() {
+            ok := raft.sendRequestVote(index, &voteArgs, &voteReply)
+
+            if !ok {
+                log.Fatalf("发送投票请求失败，server index: %d.", index)
+                return
+            }
+
+            handleVoteReply(index, raft, &voteReply)
+        }()
     }
+}
+
+// 处理投票结果：
+// 如果voteGranted为true，那么说明投票被接受，此时把服务器保存到votedFor中
+// 如果voteGranted为false，说明被拒绝，那么将自己设置为follower，并且term更新为返回中的值
+func handleVoteReply(index int, raft *Raft, voteReply *RequestVoteReply) {
+    raft.mu.Lock()
+    defer raft.mu.Unlock()
+
+    if voteReply.voteGranted {
+        // 非候选状态无意义
+        if raft.state != CANDIDATE {
+            return
+        }
+
+        if raft.votedFor == nil {
+            raft.votedFor = make(map[int]bool)
+        }
+
+        raft.votedFor[index] = true
+
+        convertToLeaderIfNecessary(raft)
+    } else {
+        // TODO 如果已经成了leader，那么就不能转为follower
+        raft.state = FOLLOWER
+        // 清空"粉丝"
+        raft.votedFor = nil
+        if raft.currentTerm < voteReply.term {
+            raft.currentTerm = voteReply.term
+        }
+    }
+
+}
+
+// 如果已获得多数票，转为leader
+// 此函数一定要在持有锁的情况下调用
+func convertToLeaderIfNecessary(raft *Raft) {
+    total := len(raft.peers)
+    received := len(raft.votedFor)
+
+    if total / received > 2 {
+        return
+    }
+
+
 }
