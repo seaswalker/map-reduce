@@ -7,10 +7,10 @@ package raft
 //
 // rf = Make(...)
 //   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
+// rf.Start(command interface{}) (index, Term, isleader)
 //   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
+// rf.GetState() (Term, isLeader)
+//   ask a Raft for its current Term, and whether it thinks it is leader
 // ApplyMsg
 //   each time a new entry is committed to the log, each Raft peer
 //   should send an ApplyMsg to the service (or tester)
@@ -20,6 +20,7 @@ package raft
 import (
     "log"
     "math/rand"
+    "strconv"
     "sync"
     "time"
 )
@@ -78,10 +79,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-    var term int
-    var isleader bool
     // Your code here (2A).
-    return term, isleader
+    return rf.currentTerm, rf.state == LEADER
 }
 
 //
@@ -128,10 +127,15 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
     // Your data here (2A, 2B).
-    term         int
-    candidateId  int
-    lastLogIndex int
-    lastLogTerm  int
+    Term         int
+    CandidateId  int
+    LastLogIndex int
+    LastLogTerm  int
+}
+
+type AppendEntriesArgs struct {
+    Term     int
+    LeaderId int
 }
 
 //
@@ -140,8 +144,13 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
     // Your data here (2A).
-    term        int
-    voteGranted bool
+    Term        int
+    VoteGranted bool
+}
+
+type AppendEntriesReply struct {
+    Term    int
+    Success bool
 }
 
 //
@@ -149,6 +158,17 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
+    reply.Term = rf.currentTerm
+    reply.VoteGranted = rf.currentTerm <= args.Term
+    log.Printf("收到投票请求，候选人ID: %d，term: %d，当前term: %d，当前ID: %d，回复: %s.",
+        args.CandidateId, args.Term, rf.currentTerm, rf.me, strconv.FormatBool(reply.VoteGranted),
+    )
+}
+
+// 维持leadership
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+    reply.Term = rf.currentTerm
+    reply.Success = rf.currentTerm <= args.Term
 }
 
 //
@@ -185,6 +205,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
     return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+    return rf.peers[server].Call("Raft.AppendEntries", args, reply)
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -196,7 +220,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 // the first return value is the index that the command will appear at
 // if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
+// Term. the third return value is true if this server believes it is
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -255,10 +279,10 @@ func initRaft(raft *Raft) {
     raft.state = FOLLOWER
     now := time.Now()
 
-    raft.lastLeaderTime = now.Unix()
+    raft.lastLeaderTime = now.UnixNano() / 1000
     // 选取超时时间的范围为250-350ms
-    rand.Seed(now.UnixNano())
     raft.electionTimeout = 250 + rand.Intn(101)
+    log.Printf("选举超时时间: %d，ID: %d.", raft.electionTimeout, raft.me)
 }
 
 func startServer(peer *labrpc.ClientEnd) {
@@ -275,15 +299,29 @@ func startElectIfNecessary(raft *Raft) {
 
     ticker := time.NewTicker(d)
 
-    defer ticker.Stop()
-
     go func() {
-        for t := range ticker.C {
-            if t.Unix()-raft.lastLeaderTime > 350 {
+        for range ticker.C {
+            now := time.Now().UnixNano() / 1000
+            if now - raft.lastLeaderTime > 350 {
+                raft.mu.Lock()
+                state := raft.state
+                raft.mu.Unlock()
+
+                if state == CANDIDATE {
+                    continue
+                }
+
+                raft.mu.Lock()
+                // 封锁后续的选举
+                raft.state = CANDIDATE
+                raft.currentTerm++
+                raft.mu.Unlock()
+
                 log.Printf(
                     "上一次收到leader信息时间: %d，当前时间: %d，启动选举，当前term: %d，server id: %d.\n",
-                    raft.lastLeaderTime, t.Unix(), raft.currentTerm, raft.me,
+                    raft.lastLeaderTime, now, raft.currentTerm, raft.me,
                 )
+
                 go elect(raft)
             }
         }
@@ -293,10 +331,15 @@ func startElectIfNecessary(raft *Raft) {
 func elect(raft *Raft) {
     // 向所有的其它服务器广播选举请求
     for index := range raft.peers {
-        voteArgs := RequestVoteArgs{term: raft.currentTerm, candidateId: index}
+        if index == raft.me {
+            continue
+        }
+
+        voteArgs := RequestVoteArgs{Term: raft.currentTerm, CandidateId: raft.me}
         voteReply := RequestVoteReply{}
 
         go func() {
+            log.Printf("%d向%d发送投票申请，当前term: %d.", raft.me, index, raft.currentTerm)
             ok := raft.sendRequestVote(index, &voteArgs, &voteReply)
 
             if !ok {
@@ -316,7 +359,7 @@ func handleVoteReply(index int, raft *Raft, voteReply *RequestVoteReply) {
     raft.mu.Lock()
     defer raft.mu.Unlock()
 
-    if voteReply.voteGranted {
+    if voteReply.VoteGranted {
         // 非候选状态无意义
         if raft.state != CANDIDATE {
             return
@@ -334,8 +377,8 @@ func handleVoteReply(index int, raft *Raft, voteReply *RequestVoteReply) {
         raft.state = FOLLOWER
         // 清空"粉丝"
         raft.votedFor = nil
-        if raft.currentTerm < voteReply.term {
-            raft.currentTerm = voteReply.term
+        if raft.currentTerm < voteReply.Term {
+            raft.currentTerm = voteReply.Term
         }
     }
 
@@ -344,12 +387,55 @@ func handleVoteReply(index int, raft *Raft, voteReply *RequestVoteReply) {
 // 如果已获得多数票，转为leader
 // 此函数一定要在持有锁的情况下调用
 func convertToLeaderIfNecessary(raft *Raft) {
-    total := len(raft.peers)
-    received := len(raft.votedFor)
-
-    if total / received > 2 {
+    if !isReceiveMajorityVote(raft) {
         return
     }
 
+    raft.state = LEADER
+    raft.votedFor = nil
 
+    startKeepLeaderShip(raft)
+}
+
+func isReceiveMajorityVote(raft *Raft) bool {
+    total := len(raft.peers)
+    received := len(raft.votedFor)
+
+    return total / received < 2
+}
+
+func startKeepLeaderShip(raft *Raft) {
+    // 应小于超时的最大时长
+    d := time.Duration(time.Millisecond * 200)
+
+    ticker := time.NewTicker(d)
+
+    go func() {
+        for range ticker.C {
+            doKeepLeaderShip(raft)
+            log.Printf("Start to keep leadership.")
+        }
+    }()
+ }
+
+func doKeepLeaderShip(raft *Raft) {
+    for index := range raft.peers {
+        if index == raft.me {
+            continue
+        }
+
+        go func() {
+            args := AppendEntriesArgs{Term: raft.currentTerm, LeaderId: raft.me}
+            reply := AppendEntriesReply{}
+            raft.sendAppendEntries(index, &args, &reply)
+
+            if !reply.Success {
+                // ops, lose leadership...
+                raft.mu.Lock()
+                defer raft.mu.Unlock()
+                raft.state = FOLLOWER
+                raft.currentTerm = reply.Term
+            }
+        }()
+    }
 }
