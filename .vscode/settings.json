@@ -1,0 +1,5 @@
+{
+    "http.proxy": "http://127.0.0.1:7890",
+    "http.proxySupport": "on",
+    "go.installDependenciesWhenBuilding": false
+}
