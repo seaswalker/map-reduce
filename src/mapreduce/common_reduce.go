@@ -108,7 +108,7 @@ func handleOneIntermediateReduceFile(fileName string, reduced map[string][]strin
 func sortAllValues(reduced map[string][]string) {
 	for _, value := range reduced {
 		sort.Slice(value, func(i, j int) bool {
-			return strings.Compare(value[i], value[j]) > 0
+			return strings.Compare(value[i], value[j]) < 0
 		})
 	}
 }
