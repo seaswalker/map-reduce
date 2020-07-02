@@ -17,8 +17,6 @@ package raft
 //
 
 import (
-    "encoding/json"
-    "log"
     "math/rand"
     "sync"
     "time"
@@ -163,22 +161,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     defer rf.mu.Unlock()
     term := rf.currentTerm
 
-    str, _ := json.Marshal(args)
-    log.Printf("%d收到投票请求, 参数: %s.", rf.me, str)
-
     if term >= args.Term {
         reply.VoteGranted = false
         reply.Term = term
+        DPrintf("%d拒绝%d的投票请求, 当前term: %d, 请求term: %d.", rf.me, args.CandidateId, rf.currentTerm, args.Term)
         return
     }
 
-    if term < args.Term {
-        rf.state = FOLLOWER
-        rf.currentTerm = args.Term
-        reply.VoteGranted = true
-        reply.Term = args.Term
-        return
-    }
+    rf.state = FOLLOWER
+    rf.currentTerm = args.Term
+    reply.VoteGranted = true
+    reply.Term = args.Term
+    DPrintf("%d投票给%d, 当前term: %d, 请求term: %d.", rf.me, args.CandidateId, rf.currentTerm, args.Term)
+
 }
 
 // 维持leadership
@@ -190,13 +185,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
     if rf.currentTerm > args.Term {
         reply.Success = false
+        DPrintf("%d拒绝%d的leader rpc, 请求term: %d, 当前term: %d.", rf.me, args.LeaderId, args.Term, rf.currentTerm)
         return
     }
 
+    if rf.state == LEADER {
+        rf.keepLeadershipTicker.Stop()
+        DPrintf("%d停止发送leader rpc.", rf.me)
+    }
     rf.lastLeadershipHeartbeat = currentMills()
     rf.state = FOLLOWER
     rf.currentTerm = args.Term
     reply.Success = true
+    DPrintf("%d接受%d的领导, 请求term: %d, 当前term: %d.", rf.me, args.LeaderId, args.Term, rf.currentTerm)
 }
 
 //
@@ -320,7 +321,7 @@ func startServer(peer *labrpc.ClientEnd) {
 
 func startLeadershipChecker(raft *Raft) {
     d := randomElectionTimeout(raft)
-    log.Printf("%d初始超时时间: %d毫秒.", raft.me, raft.electionTimeout)
+    DPrintf("%d初始超时时间: %d毫秒.", raft.me, raft.electionTimeout)
     timer := time.NewTimer(d)
 
     for {
@@ -334,15 +335,15 @@ func startLeadershipChecker(raft *Raft) {
         case FOLLOWER:
             now := currentMills()
             timer.Reset(d)
-            if now-raft.lastLeadershipHeartbeat >= raft.electionTimeout {
-                log.Printf("Follower: %d超时, 开始选举, 选举超时时间: %d毫秒.\n", raft.me, raft.electionTimeout)
+            if now - raft.lastLeadershipHeartbeat >= raft.electionTimeout {
+                DPrintf("Follower%d超时, 开始选举, 选举超时时间: %d毫秒.\n", raft.me, raft.electionTimeout)
                 go elect(raft)
             }
             break
         case CANDIDATE:
             d = randomElectionTimeout(raft)
             timer.Reset(d)
-            log.Printf("Candidate: %d选举失败，重新开始选举超时时间: %d毫秒.\n", raft.me, raft.electionTimeout)
+            DPrintf("Candidate: %d选举失败，重新开始选举超时时间: %d毫秒.\n", raft.me, raft.electionTimeout)
             go elect(raft)
             break
         case LEADER:
@@ -355,10 +356,14 @@ func currentMills() int64 {
     return time.Now().UnixNano() / 1e6
 }
 
+func millToNano(mill int64) int64 {
+    return mill * 1e6
+}
+
 func randomElectionTimeout(raft *Raft) time.Duration {
     // 选取超时时间的范围为150-300ms
     raft.electionTimeout = int64(150 + rand.Intn(151))
-    return time.Duration(raft.electionTimeout * 1000)
+    return time.Duration(millToNano(raft.electionTimeout))
 }
 
 func elect(raft *Raft) {
@@ -390,12 +395,12 @@ func requestVotes(raft *Raft) {
 
 func requestVote(raft *Raft, voteArgs *RequestVoteArgs, index int) {
     voteReply := RequestVoteReply{}
-    log.Printf("%d向%d发送投票申请，当前term: %d.", raft.me, index, raft.currentTerm)
+    DPrintf("%d向%d发送投票申请，当前term: %d.", raft.me, index, raft.currentTerm)
     ok := raft.sendRequestVote(index, voteArgs, &voteReply)
 
     // 请求发送失败，也就是得不到投票结果，raft算法应该可以自动处理此种异常
     if !ok {
-        log.Fatalf("%d向%d发送投票请求失败, term: %d.", raft.me, index, raft.currentTerm)
+        DPrintf("%d向%d发送投票请求失败, term: %d.", raft.me, index, raft.currentTerm)
         return
     }
 
@@ -411,6 +416,7 @@ func handleVoteReply(index int, raft *Raft, voteArgs *RequestVoteArgs, voteReply
 
     // 说明当前server已经开始了新一轮candidate选举，老的投票结果不再关心
     if voteArgs.Term < raft.currentTerm {
+        DPrintf("%d丢弃%d的%d term同意票，当前term: %d.", raft.me, index, voteArgs.Term, raft.currentTerm)
         return
     }
 
@@ -433,7 +439,7 @@ func handleVoteReply(index int, raft *Raft, voteArgs *RequestVoteArgs, voteReply
 // 如果已获得多数票，转为leader
 // 此函数一定要在持有锁的情况下调用
 func convertToLeaderIfNecessary(raft *Raft, index int) {
-    log.Printf("%d收到: %d的赞成响应, term: %d.", raft.me, index, raft.currentTerm)
+    DPrintf("%d收到%d的赞成响应, term: %d.", raft.me, index, raft.currentTerm)
     if raft.state == LEADER {
         // 已经获得了多数票，不需要再做任何处理
         return
@@ -446,7 +452,7 @@ func convertToLeaderIfNecessary(raft *Raft, index int) {
 
     raft.state = LEADER
     raft.votedFor = nil
-    log.Printf("%d选举成功，term: %d.", raft.me, raft.currentTerm)
+    DPrintf("%d选举成功，term: %d.", raft.me, raft.currentTerm)
 
     go startKeepLeaderShip(raft)
 }
@@ -480,23 +486,23 @@ func doKeepLeaderShip(raft *Raft) {
         go func() {
             args := AppendEntriesArgs{Term: raft.currentTerm, LeaderId: raft.me}
             reply := AppendEntriesReply{}
+            DPrintf("%d向%d发送leader rpc请求, term: %d.", raft.me, index, raft.currentTerm)
             ok :=raft.sendAppendEntries(index, &args, &reply)
-            log.Printf("%d向%d发送leader rpc请求.", raft.me, index)
 
             if !ok {
-                log.Printf("%d向%d发送leadership rpc失败, term: %d.", raft.me, index, raft.currentTerm)
+                DPrintf("%d向%d发送leadership rpc失败, term: %d.", raft.me, index, raft.currentTerm)
                 return
             }
 
             raft.mu.Lock()
             if !reply.Success && raft.state == LEADER {
-                log.Printf("%d维持leadership失败，不再发送leadership rpc.", raft.me)
+                DPrintf("%d维持leadership失败，不再发送leadership rpc.", raft.me)
                 // 没有成功，说明集群中有了更高的term，所以当前server应转为follower
                 raft.currentTerm = reply.Term
                 raft.state = FOLLOWER
                 raft.keepLeadershipTicker.Stop()
                 raft.lastLeadershipHeartbeat = currentMills()
-                startLeadershipChecker(raft)
+                go startLeadershipChecker(raft)
             }
             raft.mu.Unlock()
         }()
