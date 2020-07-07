@@ -67,11 +67,24 @@ type Raft struct {
 
     currentTerm int
     votedFor    map[int]bool
-    state       int
+    // TODO 数组的长度？
+    log [10]*LogEntry
+
+    commitIndex int
+    lastApplied int
+
+    currentIndex int
+    state        int
     // 当前Server选取过期时间(毫秒)
-    electionTimeout int64
+    electionTimeout         int64
     lastLeadershipHeartbeat int64
-    keepLeadershipTicker *time.Ticker
+    keepLeadershipTicker    *time.Ticker
+}
+
+type LogEntry struct {
+    index int
+    term int
+    command interface{}
 }
 
 // return currentTerm and whether this server
@@ -133,8 +146,12 @@ type RequestVoteArgs struct {
 }
 
 type AppendEntriesArgs struct {
-    Term     int
-    LeaderId int
+    Term         int
+    LeaderId     int
+    preLogIndex  int
+    prevLogTerm  int
+    entries      []LogEntry
+    leaderCommit int
 }
 
 //
@@ -253,13 +270,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-    index := -1
-    term := -1
-    isLeader := true
-
     // Your code here (2B).
 
-    return index, term, isLeader
+    if rf.state != LEADER {
+        return rf.currentIndex, rf.currentTerm, false
+    }
+
+    rf.mu.Lock()
+    index := rf.currentIndex
+    rf.currentIndex++
+    rf.mu.Unlock()
+
+    go startReplicate(index, command, rf)
+
+    return index, rf.currentTerm, true
 }
 
 //
@@ -309,6 +333,11 @@ func initRaft(raft *Raft) {
     raft.currentTerm = 0
     raft.state = FOLLOWER
     raft.lastLeadershipHeartbeat = currentMills()
+
+    //lab 2B
+    raft.currentIndex = 0
+    raft.commitIndex = -1
+    raft.lastApplied = -1
 }
 
 func startServer(peer *labrpc.ClientEnd) {
@@ -507,4 +536,53 @@ func doKeepLeaderShip(raft *Raft) {
             raft.mu.Unlock()
         }()
     }
+}
+
+// 当前为leader，开始向follower发送AppendEntries消息
+func startReplicate(logIndex int, command interface{}, raft *Raft) {
+    entry := LogEntry{
+        index:   logIndex,
+        term:    raft.currentTerm,
+        command: command,
+    }
+
+    raft.log[logIndex] = &entry
+
+    for index := range raft.peers {
+        if index == raft.me {
+            continue
+        }
+        go replicateToPeer(index, raft)
+    }
+}
+
+func replicateToPeer(index int, raft *Raft) {
+    prevLogTerm := -1
+    if index > 0 {
+        prevLogTerm = raft.log[index-1].term
+    }
+
+    args := AppendEntriesArgs{
+        Term:        raft.currentTerm,
+        LeaderId:    raft.me,
+        preLogIndex: index - 1,
+        prevLogTerm: prevLogTerm,
+        // TODO 之后再处理leader挂掉新leader需要覆盖follower数据的情况
+        entries:      nil,
+        leaderCommit: raft.commitIndex,
+    }
+    reply := AppendEntriesReply{}
+
+    for {
+        ok := raft.sendAppendEntries(index, &args, &reply)
+        if ok {
+            break
+        }
+    }
+
+    // TODO 如果success为false，说明follower已经落后与leader，需要同步，稍后处理
+    if reply.Success {
+
+    }
+
 }
