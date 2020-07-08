@@ -17,6 +17,7 @@ package raft
 //
 
 import (
+    "log"
     "math/rand"
     "sync"
     "time"
@@ -67,7 +68,6 @@ type Raft struct {
 
     currentTerm int
     votedFor    map[int]bool
-    // TODO 数组的长度？
     log         []*LogEntry
 
     commitIndex int
@@ -80,7 +80,7 @@ type Raft struct {
     lastLeadershipHeartbeat int64
 
     // leader专属属性
-    keepLeadershipTicker *time.Ticker
+    heartbeatTicker *time.Ticker
     // 每个follower下一个entry存放位置
     nextIndex []int
     // 每个follower最高的已经完成备份的位置
@@ -196,10 +196,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     reply.VoteGranted = true
     reply.Term = args.Term
     DPrintf("%d投票给%d, 当前term: %d, 请求term: %d.", rf.me, args.CandidateId, rf.currentTerm, args.Term)
-
 }
 
-// 维持leadership
+// 处理AppendEntries请求(维持leader地位、log复制)
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     rf.mu.Lock()
     defer rf.mu.Unlock()
@@ -208,19 +207,62 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
     if rf.currentTerm > args.Term {
         reply.Success = false
-        DPrintf("%d拒绝%d的leader rpc, 请求term: %d, 当前term: %d.", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+        DPrintf("%d拒绝%d的心跳, 请求term: %d, 当前term: %d.", rf.me, args.LeaderId, args.Term, rf.currentTerm)
         return
     }
 
-    if rf.state == LEADER {
-        rf.keepLeadershipTicker.Stop()
-        DPrintf("%d停止发送leader rpc.", rf.me)
+    // 存在这样的情况: 当follower宕机又重新上线(term = 0)时，当前server既是follower，其term又比请求中的小
+    if rf.currentTerm < args.Term {
+        rf.currentTerm = args.Term
     }
-    rf.lastLeadershipHeartbeat = currentMills()
-    rf.state = FOLLOWER
-    rf.currentTerm = args.Term
+
+    if rf.state != FOLLOWER {
+        switchToFollower(rf, args.Term)
+    }
+
+    if args.entries != nil {
+        if !checkPrevLog(rf, args) {
+            reply.Success = false
+            return
+        }
+        replicateToLocal(rf, args)
+    }
+
     reply.Success = true
     DPrintf("%d接受%d的领导, 请求term: %d, 当前term: %d.", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+}
+
+func checkPrevLog(raft *Raft, args *AppendEntriesArgs) bool {
+    if args.preLogIndex >= raft.currentIndex {
+        return false
+    }
+
+    if args.preLogIndex == -1 {
+        return true
+    }
+
+    return raft.log[args.preLogIndex].term == args.Term
+}
+
+func replicateToLocal(raft *Raft, args *AppendEntriesArgs) {
+    writeIndex := args.preLogIndex
+    for i := 0; i < len(args.entries); i++ {
+        writeIndex++
+        raft.log[writeIndex] = args.entries[i]
+    }
+
+    diff := 0
+    for i := writeIndex + 1; i < raft.currentIndex; i++ {
+        if raft.log[i].term != args.Term {
+            raft.log[i] = nil
+            diff++
+        }
+    }
+    raft.currentIndex -= diff
+
+    if writeIndex >= raft.currentIndex {
+        raft.currentIndex = writeIndex + 1
+    }
 }
 
 //
@@ -282,7 +324,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
         return rf.currentIndex, rf.currentTerm, false
     }
 
-    index := startReplicate(command, rf)
+    index := startAgreement(command, rf)
 
     return index, rf.currentTerm, true
 }
@@ -413,6 +455,17 @@ func switchToCandidate(raft *Raft) {
     raft.mu.Unlock()
 }
 
+// 当收到term更高的AppendEntries请求或向其它服务器发送AppendEntries失败时
+func switchToFollower(raft *Raft, term int) {
+    raft.state = FOLLOWER
+    raft.lastLeadershipHeartbeat = currentMills()
+    raft.currentTerm = term
+    if raft.state == LEADER {
+        raft.heartbeatTicker.Stop()
+        go startLeadershipChecker(raft)
+    }
+}
+
 func requestVotes(raft *Raft) {
     for index := range raft.peers {
         if index == raft.me {
@@ -505,23 +558,23 @@ func doConvertToLeader(raft *Raft) {
         raft.nextIndex[index] = raft.currentIndex
     }
 
-    go startKeepLeaderShip(raft)
+    go startHeartbeat(raft)
 }
 
-func startKeepLeaderShip(raft *Raft) {
+func startHeartbeat(raft *Raft) {
     // 应小于超时的最大时长
     ticker := time.NewTicker(AppendEntriesTimeInterval)
-    raft.keepLeadershipTicker = ticker
+    raft.heartbeatTicker = ticker
 
     // 先立即执行一次
-    doKeepLeaderShip(raft)
+    doStartHeartbeat(raft)
 
     for range ticker.C {
-        doKeepLeaderShip(raft)
+        doStartHeartbeat(raft)
     }
 }
 
-func doKeepLeaderShip(raft *Raft) {
+func doStartHeartbeat(raft *Raft) {
     for index := range raft.peers {
         if index == raft.me {
             continue
@@ -541,12 +594,7 @@ func doKeepLeaderShip(raft *Raft) {
             raft.mu.Lock()
             if !reply.Success && raft.state == LEADER {
                 DPrintf("%d维持leadership失败，不再发送leadership rpc.", raft.me)
-                // 没有成功，说明集群中有了更高的term，所以当前server应转为follower
-                raft.currentTerm = reply.Term
-                raft.state = FOLLOWER
-                raft.keepLeadershipTicker.Stop()
-                raft.lastLeadershipHeartbeat = currentMills()
-                go startLeadershipChecker(raft)
+                switchToFollower(raft, reply.Term)
             }
             raft.mu.Unlock()
         }()
@@ -554,7 +602,7 @@ func doKeepLeaderShip(raft *Raft) {
 }
 
 // 当前为leader，开始向follower发送AppendEntries消息
-func startReplicate(command interface{}, raft *Raft) int {
+func startAgreement(command interface{}, raft *Raft) int {
     raft.mu.Lock()
     logIndex := raft.currentIndex
     raft.currentIndex++
@@ -572,13 +620,13 @@ func startReplicate(command interface{}, raft *Raft) int {
         if serverId == raft.me {
             continue
         }
-        go replicateToPeer(serverId, logIndex, raft)
+        go replicateToFollower(serverId, logIndex, raft)
     }
 
     return logIndex
 }
 
-func replicateToPeer(serverId int, logIndex int, raft *Raft) {
+func replicateToFollower(serverId int, logIndex int, raft *Raft) {
     serverNextIndex := raft.nextIndex[serverId]
 
     var entries []*LogEntry
@@ -610,18 +658,68 @@ func replicateToPeer(serverId int, logIndex int, raft *Raft) {
 
         if reply.Success {
             commitLogIfPossible(logIndex, serverId, raft)
+            break
         }
+
+        if serverNextIndex == 0 {
+            // 正常情况不可能发生
+            log.Fatalf("当%d的nextIndex为0时AppendEntries返回失败.", serverId)
+        }
+
+        raft.mu.Lock()
+        // 可能有多个协程同时失败(当leader在短时间内收到多个请求时)，不能让nextIndex减为负数
+        if raft.nextIndex[serverId] > 0 {
+            raft.nextIndex[serverId]--
+        }
+        raft.mu.Unlock()
+
+        replicateToFollower(serverId, logIndex, raft)
+        break
     }
 }
 
 func commitLogIfPossible(logIndex int, serverId int, raft *Raft) {
-    if logIndex < raft.commitIndex {
+    raft.mu.Lock()
+
+    if logIndex <= raft.commitIndex {
         // 已经commit，无需再处理
         return
     }
 
-    raft.nextIndex[serverId] = logIndex + 1
-    raft.matchIndex[serverId] = logIndex
+    if logIndex > raft.matchIndex[serverId] {
+        // 有可能已经被更高index的请求顺带在follower上保存了副本，那么我们不需要再修改下面两个值
+        raft.matchIndex[serverId] = logIndex
+        raft.nextIndex[serverId] = logIndex + 1
+    }
 
+    if raft.log[logIndex].term != raft.currentTerm {
+        // 非当前term的entry不能提交，见paper 5.4.2
+        return
+    }
 
+    replicated := 0
+    // 是否已达到多数？
+    for id, value := range raft.matchIndex {
+        if id == raft.me || value >= logIndex {
+            replicated++
+        }
+    }
+
+    shouldCommit := len(raft.peers) / replicated < 2
+
+    if !shouldCommit {
+        raft.mu.Unlock()
+        return
+    }
+
+    raft.commitIndex = logIndex
+    raft.mu.Unlock()
+
+    for index := raft.lastApplied; index <= logIndex; index++ {
+        // 对entry.command做些什么，应用到状态机
+        // entry := raft.log[index]
+        // 再向客户端发送响应
+    }
+
+    raft.lastApplied = logIndex
 }
