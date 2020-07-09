@@ -17,6 +17,7 @@ package raft
 //
 
 import (
+    "encoding/json"
     "log"
     "math/rand"
     "sync"
@@ -73,24 +74,28 @@ type Raft struct {
     commitIndex int
     lastApplied int
 
-    currentIndex int
-    state        int
-    // 当前Server选取过期时间(毫秒)
-    electionTimeout         int64
-    lastLeadershipHeartbeat int64
-
-    // leader专属属性
-    heartbeatTicker *time.Ticker
     // 每个follower下一个entry存放位置
     nextIndex []int
     // 每个follower最高的已经完成备份的位置
     matchIndex []int
+
+    // 自定义属性(paper未定义的)
+    // 定时发送心跳，leader专属
+    heartbeatTicker         *time.Ticker
+    lastLeadershipHeartbeat int64
+    // 当前Server选取过期时间(毫秒)
+    electionTimeout int64
+    currentIndex    int
+    state           int
+    // 通知commit协程起来干活啦
+    commitCondition *sync.Cond
+    applyCh         chan ApplyMsg
 }
 
 type LogEntry struct {
-    index int
-    term int
-    command interface{}
+    Index   int
+    Term    int
+    Command interface{}
 }
 
 // return currentTerm and whether this server
@@ -153,11 +158,11 @@ type RequestVoteArgs struct {
 
 type AppendEntriesArgs struct {
     Term         int
-    LeaderId     int
-    preLogIndex  int
-    prevLogTerm  int
-    entries      []*LogEntry
-    leaderCommit int
+    LeaderId    int
+    PreLogIndex int
+    PrevLogTerm  int
+    Entries      []*LogEntry
+    LeaderCommit int
 }
 
 //
@@ -184,7 +189,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     defer rf.mu.Unlock()
     term := rf.currentTerm
 
-    if term >= args.Term {
+    if !canVoteFor(rf, args) {
         reply.VoteGranted = false
         reply.Term = term
         DPrintf("%d拒绝%d的投票请求, 当前term: %d, 请求term: %d.", rf.me, args.CandidateId, rf.currentTerm, args.Term)
@@ -220,7 +225,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         switchToFollower(rf, args.Term)
     }
 
-    if args.entries != nil {
+    if args.Entries != nil {
         if !checkPrevLog(rf, args) {
             reply.Success = false
             return
@@ -228,32 +233,68 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         replicateToLocal(rf, args)
     }
 
+    // commit
+    if args.LeaderCommit > rf.commitIndex {
+        // 封锁后续commit请求
+        DPrintf(
+            "%d commitIndex: %d, leaderIndex: %d, 提交到：%d.",
+            rf.me, rf.commitIndex, args.LeaderCommit, args.LeaderCommit,
+            )
+
+        rf.commitIndex = args.LeaderCommit
+        signalCommit(rf)
+    }
+
     reply.Success = true
+    // 可能在switchToFollower函数中被更新过一次了...
+    rf.lastLeadershipHeartbeat = currentMills()
     DPrintf("%d接受%d的领导, 请求term: %d, 当前term: %d.", rf.me, args.LeaderId, args.Term, rf.currentTerm)
 }
 
-func checkPrevLog(raft *Raft, args *AppendEntriesArgs) bool {
-    if args.preLogIndex >= raft.currentIndex {
+func canVoteFor(raft *Raft, args *RequestVoteArgs) bool {
+    if raft.currentTerm >= args.Term {
         return false
     }
 
-    if args.preLogIndex == -1 {
+    if raft.currentIndex == 0 {
         return true
     }
 
-    return raft.log[args.preLogIndex].term == args.Term
+    lastLogEntry := raft.log[raft.currentIndex - 1]
+    if lastLogEntry.Term > args.LastLogTerm {
+        return false
+    }
+
+    if lastLogEntry.Term < args.LastLogTerm {
+        return true
+    }
+
+    return raft.currentIndex - 1 <= args.LastLogIndex
+}
+
+func checkPrevLog(raft *Raft, args *AppendEntriesArgs) bool {
+    if args.PreLogIndex >= raft.currentIndex {
+        return false
+    }
+
+    if args.PreLogIndex == -1 {
+        return true
+    }
+
+    return raft.log[args.PreLogIndex].Term == args.Term
 }
 
 func replicateToLocal(raft *Raft, args *AppendEntriesArgs) {
-    writeIndex := args.preLogIndex
-    for i := 0; i < len(args.entries); i++ {
+    writeIndex := args.PreLogIndex
+    for i := 0; i < len(args.Entries); i++ {
         writeIndex++
-        raft.log[writeIndex] = args.entries[i]
+        raft.log[writeIndex] = args.Entries[i]
     }
 
     diff := 0
     for i := writeIndex + 1; i < raft.currentIndex; i++ {
-        if raft.log[i].term != args.Term {
+        // 删除冲突的entry(term不一致)
+        if raft.log[i].Term != args.Term {
             raft.log[i] = nil
             diff++
         }
@@ -356,6 +397,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.peers = peers
     rf.persister = persister
     rf.me = me
+    rf.applyCh = applyCh
 
     // Your initialization code here (2A, 2B, 2C).
 
@@ -382,6 +424,8 @@ func initRaft(raft *Raft) {
     raft.commitIndex = -1
     raft.lastApplied = -1
     raft.log = make([]*LogEntry, 16)
+    raft.commitCondition = sync.NewCond(new(sync.Mutex))
+    go commitLog(raft)
 }
 
 func startServer(peer *labrpc.ClientEnd) {
@@ -457,22 +501,27 @@ func switchToCandidate(raft *Raft) {
 
 // 当收到term更高的AppendEntries请求或向其它服务器发送AppendEntries失败时
 func switchToFollower(raft *Raft, term int) {
-    raft.state = FOLLOWER
-    raft.lastLeadershipHeartbeat = currentMills()
-    raft.currentTerm = term
     if raft.state == LEADER {
         raft.heartbeatTicker.Stop()
         go startLeadershipChecker(raft)
     }
+    raft.state = FOLLOWER
+    raft.lastLeadershipHeartbeat = currentMills()
+    raft.currentTerm = term
 }
 
 func requestVotes(raft *Raft) {
+    voteArgs := RequestVoteArgs{Term: raft.currentTerm, CandidateId: raft.me, LastLogIndex: -1, LastLogTerm: -1}
+    if raft.currentIndex > 0 {
+        lastLogEntry := raft.log[raft.currentIndex - 1]
+        voteArgs.LastLogIndex = lastLogEntry.Index
+        voteArgs.LastLogTerm = lastLogEntry.Term
+    }
+
     for index := range raft.peers {
         if index == raft.me {
             continue
         }
-
-        voteArgs := RequestVoteArgs{Term: raft.currentTerm, CandidateId: raft.me}
         go requestVote(raft, &voteArgs, index)
     }
 }
@@ -551,11 +600,14 @@ func doConvertToLeader(raft *Raft) {
 
     peerCount := len(raft.peers)
     raft.nextIndex = make([]int, peerCount)
-    // 全部初始为0
     raft.matchIndex = make([]int, peerCount)
 
     for index, _ := range raft.nextIndex {
         raft.nextIndex[index] = raft.currentIndex
+    }
+
+    for index, _ := range raft.matchIndex {
+        raft.matchIndex[index] = -1
     }
 
     go startHeartbeat(raft)
@@ -581,9 +633,9 @@ func doStartHeartbeat(raft *Raft) {
         }
         index := index
         go func() {
-            args := AppendEntriesArgs{Term: raft.currentTerm, LeaderId: raft.me}
+            args := AppendEntriesArgs{Term: raft.currentTerm, LeaderId: raft.me, LeaderCommit: raft.commitIndex}
             reply := AppendEntriesReply{}
-            DPrintf("%d向%d发送leader rpc请求, term: %d.", raft.me, index, raft.currentTerm)
+            DPrintf("%d向%d发送心跳, term: %d, commitIndex: %d.", raft.me, index, raft.currentTerm, raft.commitIndex)
             ok :=raft.sendAppendEntries(index, &args, &reply)
 
             if !ok {
@@ -608,9 +660,9 @@ func startAgreement(command interface{}, raft *Raft) int {
     raft.currentIndex++
 
     entry := LogEntry{
-        index:   logIndex,
-        term:    raft.currentTerm,
-        command: command,
+        Index:   logIndex,
+        Term:    raft.currentTerm,
+        Command: command,
     }
 
     raft.log[logIndex] = &entry
@@ -638,23 +690,32 @@ func replicateToFollower(serverId int, logIndex int, raft *Raft) {
     args := AppendEntriesArgs{
         Term:         raft.currentTerm,
         LeaderId:     raft.me,
-        preLogIndex:  serverNextIndex - 1,
-        prevLogTerm:  -1,
-        entries:      entries,
-        leaderCommit: raft.commitIndex,
+        PreLogIndex:  serverNextIndex - 1,
+        PrevLogTerm:  -1,
+        Entries:      entries,
+        LeaderCommit: raft.commitIndex,
     }
 
     if serverNextIndex > 0 {
-        args.prevLogTerm = raft.log[serverNextIndex - 1].term
+        args.PrevLogTerm = raft.log[serverNextIndex - 1].Term
     }
 
     reply := AppendEntriesReply{}
 
     for {
         ok := raft.sendAppendEntries(serverId, &args, &reply)
+
+        // debug
+        result, _ := json.Marshal(args)
+        DPrintf("%d向%d发送log replicate请求, 参数: %v.", raft.me, serverId, string(result))
+
         if !ok {
             continue
         }
+
+        DPrintf("Leader: %d收到%d的AppendEntries响应: term: %d, success: %v.",
+            raft.me, serverId, reply.Term, reply.Success,
+            )
 
         if reply.Success {
             commitLogIfPossible(logIndex, serverId, raft)
@@ -680,6 +741,7 @@ func replicateToFollower(serverId int, logIndex int, raft *Raft) {
 
 func commitLogIfPossible(logIndex int, serverId int, raft *Raft) {
     raft.mu.Lock()
+    defer raft.mu.Unlock()
 
     if logIndex <= raft.commitIndex {
         // 已经commit，无需再处理
@@ -692,7 +754,7 @@ func commitLogIfPossible(logIndex int, serverId int, raft *Raft) {
         raft.nextIndex[serverId] = logIndex + 1
     }
 
-    if raft.log[logIndex].term != raft.currentTerm {
+    if raft.log[logIndex].Term != raft.currentTerm {
         // 非当前term的entry不能提交，见paper 5.4.2
         return
     }
@@ -708,18 +770,47 @@ func commitLogIfPossible(logIndex int, serverId int, raft *Raft) {
     shouldCommit := len(raft.peers) / replicated < 2
 
     if !shouldCommit {
-        raft.mu.Unlock()
         return
     }
 
     raft.commitIndex = logIndex
-    raft.mu.Unlock()
+    signalCommit(raft)
+    DPrintf("Leader: %d提交到: %d.", raft.me, logIndex)
+}
 
-    for index := raft.lastApplied; index <= logIndex; index++ {
-        // 对entry.command做些什么，应用到状态机
-        // entry := raft.log[index]
-        // 再向客户端发送响应
+func commitLog(raft *Raft) {
+    for {
+        waitCommit(raft)
+
+        DPrintf("")
+
+        // 有新的entry可以commit
+        for index := raft.lastApplied + 1; index <= raft.commitIndex; index++ {
+            DPrintf("%d发送Apply消息, index: %d.", raft.me, index)
+
+            applyMessage := ApplyMsg{
+                CommandValid: true,
+                Command:      raft.log[index].Command,
+                CommandIndex: index,
+            }
+
+            raft.applyCh <- applyMessage
+        }
+
+        raft.lastApplied = raft.commitIndex
     }
+}
 
-    raft.lastApplied = logIndex
+func waitCommit(raft *Raft) {
+    raft.commitCondition.L.Lock()
+    for ;raft.lastApplied >= raft.commitIndex; {
+        raft.commitCondition.Wait()
+    }
+    raft.commitCondition.L.Unlock()
+}
+
+func signalCommit(raft *Raft) {
+    raft.commitCondition.L.Lock()
+    raft.commitCondition.Broadcast()
+    raft.commitCondition.L.Unlock()
 }
