@@ -449,23 +449,14 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
-			// TODO
-			DPrintf("有人声称leader! index是：%d.", index)
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
-
-				// TODO
-				DPrintf("nCommitted响应结果：nd: %d, cmd1: %d.", nd, cmd1)
 
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
 						// and it was the command we submitted.
-
-						// TODO
-						DPrintf("返回的index: %d.", index)
-
 						return index
 					}
 				}

@@ -8,7 +8,9 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
@@ -79,7 +81,6 @@ func TestReElection2A(t *testing.T) {
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
-	DPrintf("Check one leader通过.")
 	DPrintf("Check one leader通过.")
 
 	// re-join of last node shouldn't prevent leader from existing.
@@ -163,7 +164,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
 	}
-	if index != 2 {
+	if index != 1 {
 		t.Fatalf("expected index 2, got %v", index)
 	}
 
@@ -186,7 +187,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	if ok2 == false {
 		t.Fatalf("leader2 rejected Start()")
 	}
-	if index2 < 2 || index2 > 3 {
+	if index2 < 1 || index2 > 2 {
 		t.Fatalf("unexpected index %v", index2)
 	}
 
@@ -307,6 +308,8 @@ func TestRejoin2B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+	DPrintf("Check one leader通过.")
+
 	cfg.disconnect(leader1)
 
 	// make old leader try to agree on some entries
@@ -319,6 +322,8 @@ func TestRejoin2B(t *testing.T) {
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
+	DPrintf("Check one leader通过.")
+
 	cfg.disconnect(leader2)
 
 	// old leader connected again
