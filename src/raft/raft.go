@@ -22,7 +22,6 @@ import (
     "math/rand"
     "strconv"
     "sync"
-    "sync/atomic"
     "time"
 )
 import "labrpc"
@@ -55,7 +54,11 @@ const (
     KILLED
 )
 
+// 心跳发送间隔
 const AppendEntriesTimeInterval = time.Millisecond * 75
+const MaxQueuedEntryCount = 10
+// 毫秒
+const QueuedEntryExpireTime = 20
 
 //
 // A Go object implementing a single Raft peer.
@@ -87,14 +90,21 @@ type Raft struct {
     heartbeatTicker         *time.Ticker
     heartbeatChan           chan bool
     lastLeadershipHeartbeat int64
+    // 收到客户端请求时，缓存一定数量再向follower发起replicate请求
+    queuedEntryCount int
+    // 上一次收到客户端请求并进行缓存的时间(毫秒)
+    lastQueueEntryTime           int64
+    // 定期检查排队的客户端请求是否已过期
+    queuedEntryExpireCheckTicker *time.Ticker
+    queuedEntryExpireCheckChan   chan bool
+
     // 当前Server选取过期时间(毫秒)
     electionTimeout int64
     currentIndex    int
     state           int
     // 通知commit协程起来干活啦
-    commitCondition         *sync.Cond
-    applyCh                 chan ApplyMsg
-    logReplicateTransaction []int32
+    commitCondition *sync.Cond
+    applyCh         chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -194,11 +204,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
     rf.mu.Lock()
     defer rf.mu.Unlock()
-    term := rf.currentTerm
 
     if canVote, reason := canVoteFor(rf, args); !canVote {
         reply.VoteGranted = false
-        reply.Term = term
+        reply.Term = rf.currentTerm
+        // 不投票给对方有两种原因：
+        // 1. 对方term <= 当前server term
+        // 2. 当前server日志比对方更新
+        // 在第二种情况下，虽然我们不把票投给对方，但是对方的term我们需要吸收，否则可能导致选不出leader，这种情况在TestRejoin2B种可以复现
+        if args.Term > rf.currentTerm {
+            rf.currentTerm = args.Term
+        }
         DPrintf("%d拒绝%d的投票请求: %v.", rf.me, args.CandidateId, reason)
         return
     }
@@ -207,11 +223,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
     reply.VoteGranted = true
     reply.Term = args.Term
-    DPrintf("%d投票给%d, 当前term: %d, 请求term: %d.", rf.me, args.CandidateId, term, args.Term)
+    DPrintf("%d投票给%d.", rf.me, args.CandidateId)
 }
 
 // 处理AppendEntries请求(维持leader地位、log复制)
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+    if args == nil || reply == nil {
+        return
+    }
+
     rf.mu.Lock()
     defer rf.mu.Unlock()
 
@@ -388,15 +408,34 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
     // Your code here (2B).
 
+    rf.mu.Lock()
     if rf.state != LEADER {
+        rf.mu.Unlock()
         return rf.currentIndex, rf.currentTerm, false
     }
 
-    DPrintf("Leader: %d收到客户端请求: %v.", rf.me, command)
+    savedIndex := saveLogEntry(command, rf)
 
-    index := startAgreement(command, rf)
+    shouldStartAgreement := false
+    logIndex := 0
+    rf.queuedEntryCount++
+    rf.lastQueueEntryTime = currentMills()
 
-    return index, rf.currentTerm, true
+    if rf.queuedEntryCount >= MaxQueuedEntryCount {
+        shouldStartAgreement = true
+        logIndex = rf.currentIndex - 1
+        DPrintf("客户端请求: %v导致%d缓存的请求数: %d已达上限, 立即开始replicate.", command, rf.me, rf.queuedEntryCount)
+        rf.queuedEntryCount = 0
+    } else {
+        DPrintf("客户端请求: %v被%d缓存, 目前缓存数: %d.", command, rf.me, rf.queuedEntryCount)
+    }
+    rf.mu.Unlock()
+
+    if shouldStartAgreement {
+        startAgreement(rf, logIndex)
+    }
+
+    return savedIndex, rf.currentTerm, true
 }
 
 //
@@ -407,9 +446,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
     // Your code here, if desired.
+    // 如果不把这些协程关闭，使用go test -count=20测试时可能会失败，而且会跑满CPU，推测go test -count多次测试始终是一个进程，所以之前
+    // 创建的协程始终在运行，Kill方法会被config.cleanup调用
     if rf.heartbeatTicker != nil {
         rf.heartbeatTicker.Stop()
         rf.heartbeatChan <- true
+
+        rf.queuedEntryExpireCheckTicker.Stop()
+        rf.queuedEntryExpireCheckChan <- true
     }
 
     rf.state = KILLED
@@ -462,7 +506,6 @@ func initRaft(raft *Raft) {
     raft.lastApplied = -1
     raft.log = make([]*LogEntry, 1024)
     raft.commitCondition = sync.NewCond(new(sync.Mutex))
-    raft.logReplicateTransaction = make([]int32, len(raft.peers))
     go commitLog(raft)
 }
 
@@ -482,9 +525,7 @@ func startLeadershipChecker(raft *Raft) {
     for {
         <-timer.C
 
-        raft.mu.Lock()
         state := raft.state
-        raft.mu.Unlock()
 
         switch state {
         case FOLLOWER:
@@ -543,6 +584,10 @@ func switchToFollower(raft *Raft, term int) {
     if raft.state == LEADER {
         raft.heartbeatTicker.Stop()
         raft.heartbeatChan <- true
+
+        raft.queuedEntryExpireCheckTicker.Stop()
+        raft.queuedEntryExpireCheckChan <- true
+
         go startLeadershipChecker(raft)
     }
 
@@ -645,69 +690,92 @@ func doSwitchToLeader(raft *Raft) {
     // leader选举成功，执行到这里释放锁，此时集群中投否决票(term更高)的响应到来，得到锁，去执行switchFollower方法，
     // 但由于ticker尚未初始化，会导致对ticker stop操作异常(nil)
     raft.heartbeatTicker = time.NewTicker(AppendEntriesTimeInterval)
-    raft.heartbeatChan = make(chan bool)
-    go startHeartbeat(raft)
+    raft.heartbeatChan = make(chan bool, 1)
+
+    raft.queuedEntryCount = 0
+    raft.queuedEntryExpireCheckTicker = time.NewTicker(QueuedEntryExpireTime)
+    raft.queuedEntryExpireCheckChan = make(chan bool, 1)
+
+    go heartbeat(raft)
+    go checkIfQueuedEntryExpired(raft)
 }
 
-func startHeartbeat(raft *Raft) {
+func heartbeat(raft *Raft) {
     // 先立即执行一次
-    doStartHeartbeat(raft)
+    doHeartbeat(raft)
 
     for {
         select {
         case _ = <-raft.heartbeatTicker.C:
-            doStartHeartbeat(raft)
+            if raft.state != LEADER {
+                break
+            }
+            doHeartbeat(raft)
         case _ = <-raft.heartbeatChan:
             break
         }
     }
 }
 
-func doStartHeartbeat(raft *Raft) {
+func doHeartbeat(raft *Raft) {
     for index := range raft.peers {
         if index == raft.me {
             continue
         }
 
-        index := index
-
-        if raft.logReplicateTransaction[index] > 0 {
-            DPrintf("%d向%d发送心跳被事物封锁.", raft.me, index)
-            continue
-        }
+        serverId := index
 
         go func() {
-            serverNextIndex := raft.nextIndex[index]
+            prevLogIndex := raft.currentIndex - 1
+            traceId := randstring(10)
 
-            args := makeAppendEntriesArgs(raft, serverNextIndex, nil, randstring(10))
+            args := AppendEntriesArgs{
+                Term:         raft.currentTerm,
+                LeaderId:     raft.me,
+                PreLogIndex:  prevLogIndex,
+                PrevLogTerm:  -1,
+                Entries:      nil,
+                LeaderCommit: raft.commitIndex,
+                TraceId:      traceId,
+            }
+
+            if prevLogIndex >= 0 {
+                args.PrevLogTerm = raft.log[prevLogIndex].Term
+            }
 
             reply := AppendEntriesReply{}
 
-            DPrintf("%d向%d发送心跳, term: %d, commitIndex: %d, traceId: %v.",
-                raft.me, index, args.Term, args.LeaderCommit, args.TraceId,
-            )
+            DPrintf("%d向%d发送心跳: %#v.", raft.me, serverId, args)
 
-            ok :=raft.sendAppendEntries(index, args, &reply)
+            ok :=raft.sendAppendEntries(serverId, &args, &reply)
 
             if !ok {
-                DPrintf("%d向%d发送心跳失败, term: %d, traceId: %v.", raft.me, index, args.Term, args.TraceId)
+                DPrintf("%d向%d发送心跳失败, term: %d, traceId: %v.", raft.me, serverId, args.Term, args.TraceId)
                 return
             }
 
-            raft.mu.Lock()
-            // follower有可能因为prev log校验失败而返回false，这种情况不归心跳管
-            if !reply.Success && reply.Term > raft.currentTerm && raft.state == LEADER {
+            if reply.Success {
+                return
+            }
+
+            if reply.Term > raft.currentTerm {
+                raft.mu.Lock()
                 DPrintf("%d维持leadership失败，不再发送心跳, traceId: %v.", raft.me, args.TraceId)
                 switchToFollower(raft, reply.Term)
+                raft.mu.Unlock()
+                return
             }
-            raft.mu.Unlock()
+
+            if raft.state != LEADER {
+                return
+            }
+            // follower和leader的日志不匹配，开始entry弥合
+            decrementNextIndexAndRetry(raft, serverId, traceId, prevLogIndex)
         }()
     }
 }
 
-// 当前为leader，开始向follower发送AppendEntries消息
-func startAgreement(command interface{}, raft *Raft) int {
-    raft.mu.Lock()
+func saveLogEntry(command interface{}, raft *Raft) int {
     logIndex := raft.currentIndex
     raft.currentIndex++
 
@@ -718,37 +786,54 @@ func startAgreement(command interface{}, raft *Raft) int {
     }
 
     raft.log[logIndex] = &entry
-    raft.mu.Unlock()
+    return logIndex
+}
 
+// 当前为leader，开始向follower发送AppendEntries消息
+func startAgreement(raft *Raft, logIndex int) int {
     for serverId := range raft.peers {
         if serverId == raft.me {
             continue
         }
         traceId := strconv.Itoa(logIndex) + "-" + randstring(10)
-        go replicateToFollower(serverId, logIndex, raft, traceId)
+        go replicateToFollower(serverId, logIndex - 1, logIndex, raft, traceId)
     }
 
     return logIndex
 }
 
-func replicateToFollower(serverId int, logIndex int, raft *Raft, traceId string) {
-    serverNextIndex := raft.nextIndex[serverId]
-
+// AppendEntries请求的PreLogIndex和PrevLogTerm取值有两种情况：
+// 1. 当向follower发送心跳或者接到客户端请求第一次向follower发送AppendEntries时，这两个值应从leader的最新一个log entry取
+// 2. 如果1中的请求被follower拒绝，那么再从raft.log[raft.nextId[followerId] - 1]中取(递减一)，这便是寻找leader和follower都同意
+//    的log entry的过程
+// 如果不按照上述逻辑，是无法通过TestRejoin2B单元测试的
+func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, traceId string) {
     var entries []*LogEntry
-    if logIndex >= serverNextIndex {
+    if logIndex >= lowBound {
         // slice: [)
-        entries = raft.log[serverNextIndex:logIndex + 1]
+        entries = raft.log[lowBound + 1:logIndex + 1]
     }
 
-    args := makeAppendEntriesArgs(raft, serverNextIndex, entries, traceId)
+    args := AppendEntriesArgs{
+        Term:         raft.currentTerm,
+        LeaderId:     raft.me,
+        PreLogIndex:  lowBound,
+        PrevLogTerm:  -1,
+        Entries:      entries,
+        LeaderCommit: raft.commitIndex,
+        TraceId:      traceId,
+    }
+    if lowBound >= 0 {
+        args.PrevLogTerm = raft.log[lowBound].Term
+    }
     reply := AppendEntriesReply{}
 
-    beginLogReplicateTransaction(raft, serverId)
-    DPrintf("%d-%d进入事物, TraceId: %v.", raft.me, serverId, traceId)
+    // 考虑这样的情形，leader被网络阻断，期间集群选举除了新的leader，之后网络恢复，在与集群其它server完成交互(发现更高的term)之前，
+    // 收到了client写请求，随后向其它server并行发起replicate请求，其中一个请求先返回，导致当前leader转为follower，并将term更新为最新，
+    // 但此时如果有其它replicate请求现在才开始，就会带着最新的term去请求，这会导致覆盖掉其它server已经commit的log，所以这里需要检查state
+    for ; raft.state == LEADER; {
 
-    for ; raft.state != KILLED; {
-
-        ok := raft.sendAppendEntries(serverId, args, &reply)
+        ok := raft.sendAppendEntries(serverId, &args, &reply)
 
         if !ok {
             // 网络问题不可达，无限重试
@@ -756,7 +841,7 @@ func replicateToFollower(serverId int, logIndex int, raft *Raft, traceId string)
         }
 
         // debug
-        result, _ := json.Marshal(*args)
+        result, _ := json.Marshal(args)
         DPrintf("%d向%d发送log replicate请求成功, 参数: %v.", raft.me, serverId, string(result))
 
         DPrintf(
@@ -787,22 +872,10 @@ func replicateToFollower(serverId int, logIndex int, raft *Raft, traceId string)
             break
         }
 
-        raft.mu.Lock()
-        // 可能有多个协程同时失败(当leader在短时间内收到多个请求时)，不能让nextIndex减为负数
-        if raft.nextIndex[serverId] > 0 {
-            raft.nextIndex[serverId]--
-            DPrintf("把follower: %d的nextIndex改为: %d, traceId: %v.",
-                serverId, raft.nextIndex[serverId], traceId,
-            )
-        }
-        raft.mu.Unlock()
-
-        replicateToFollower(serverId, logIndex, raft, traceId)
+        // 递归
+        decrementNextIndexAndRetry(raft, serverId, traceId, logIndex)
         break
     }
-
-    closeLogReplicateTransaction(raft, serverId)
-    DPrintf("%d-%d释放事物, traceId: %v.", raft.me, serverId, traceId)
 }
 
 func commitLogIfPossible(logIndex int, serverId int, raft *Raft) {
@@ -869,6 +942,31 @@ func commitLog(raft *Raft) {
     }
 }
 
+func checkIfQueuedEntryExpired(raft *Raft) {
+    for {
+        select {
+        case _ = <-raft.queuedEntryExpireCheckTicker.C:
+            raft.mu.Lock()
+            if raft.state != LEADER {
+                raft.mu.Unlock()
+                break
+            }
+
+            now := currentMills()
+            if now - raft.lastQueueEntryTime >= QueuedEntryExpireTime && raft.queuedEntryCount > 0 {
+                raft.lastQueueEntryTime = now
+                logIndex := raft.currentIndex - 1
+                DPrintf("缓存的%d个客户端请求已过期, 开始replicate.", raft.queuedEntryCount)
+                raft.queuedEntryCount = 0
+                startAgreement(raft, logIndex)
+            }
+            raft.mu.Unlock()
+        case _ = <-raft.queuedEntryExpireCheckChan:
+            break
+        }
+    }
+}
+
 func waitCommit(raft *Raft) {
     raft.commitCondition.L.Lock()
     for ;raft.lastApplied >= raft.commitIndex; {
@@ -883,28 +981,16 @@ func signalCommit(raft *Raft) {
     raft.commitCondition.L.Unlock()
 }
 
-func makeAppendEntriesArgs(raft *Raft, serverNextIndex int, entries []*LogEntry, traceId string) *AppendEntriesArgs {
-    args := AppendEntriesArgs{
-        Term:         raft.currentTerm,
-        LeaderId:     raft.me,
-        PreLogIndex:  serverNextIndex - 1,
-        PrevLogTerm:  -1,
-        Entries:      entries,
-        LeaderCommit: raft.commitIndex,
-        TraceId:      traceId,
+func decrementNextIndexAndRetry(raft *Raft, serverId int, traceId string, logIndex int) {
+    nextLowBound := -1
+    raft.mu.Lock()
+    // 可能有多个协程同时失败(当leader在短时间内收到多个请求时)，不能让nextIndex减为负数
+    if raft.nextIndex[serverId] > 0 {
+        nextLowBound = raft.nextIndex[serverId] - 1
+        raft.nextIndex[serverId] = nextLowBound
+        DPrintf("把follower: %d的nextIndex改为: %d, traceId: %v.", serverId, nextLowBound, traceId)
     }
+    raft.mu.Unlock()
 
-    if serverNextIndex > 0 {
-        args.PrevLogTerm = raft.log[serverNextIndex - 1].Term
-    }
-
-    return &args
-}
-
-func beginLogReplicateTransaction(raft *Raft, serverId int) {
-    atomic.AddInt32(&raft.logReplicateTransaction[serverId], 1)
-}
-
-func closeLogReplicateTransaction(raft *Raft, serverId int) {
-    atomic.AddInt32(&raft.logReplicateTransaction[serverId], -1)
+    replicateToFollower(serverId, nextLowBound, logIndex, raft, traceId)
 }

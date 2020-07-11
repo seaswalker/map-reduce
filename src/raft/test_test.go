@@ -495,8 +495,9 @@ loop:
 			continue loop
 		}
 
-		if total2-total1 > (iters+1+3)*3 {
-			t.Fatalf("too many RPCs (%v) for %v entries\n", total2-total1, iters)
+		threshold := (iters+1+3)*3
+		if total2-total1 > threshold {
+			t.Fatalf("too many RPCs (%v) for %v entries, threshold: %d\n", total2-total1, iters, threshold)
 		}
 
 		success = true
