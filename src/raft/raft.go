@@ -56,7 +56,7 @@ const (
 
 // 心跳发送间隔
 const AppendEntriesTimeInterval = time.Millisecond * 75
-const MaxQueuedEntryCount = 10
+const MaxQueuedEntryCount = 50
 // 毫秒
 const QueuedEntryExpireTime = 20
 
@@ -205,25 +205,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     rf.mu.Lock()
     defer rf.mu.Unlock()
 
+    reply.VoteGranted = true
+    reply.Term = rf.currentTerm
+
+    if rf.currentTerm >= args.Term {
+        reply.VoteGranted = false
+        DPrintf(
+            "%d拒绝%d的投票请求: 当前term: %d >= 请求term: %d.",
+            rf.me, args.CandidateId, rf.currentTerm, args.Term,
+        )
+        return
+    }
+
+    // 这里虽然转为follower状态，但是不能更新心跳接收时间，否则会抑制当前server选举发起，或许在某种意义上说，
+    // 只有要更新心跳时间时才算认可了对方是leader
+    switchToFollower(rf, args.Term)
+
     if canVote, reason := canVoteFor(rf, args); !canVote {
         reply.VoteGranted = false
-        reply.Term = rf.currentTerm
-        // 不投票给对方有两种原因：
-        // 1. 对方term <= 当前server term
-        // 2. 当前server日志比对方更新
-        // 在第二种情况下，虽然我们不把票投给对方，但是对方的term我们需要吸收，否则可能导致选不出leader，这种情况在TestRejoin2B种可以复现
-        if args.Term > rf.currentTerm {
-            rf.currentTerm = args.Term
-        }
         DPrintf("%d拒绝%d的投票请求: %v.", rf.me, args.CandidateId, reason)
         return
     }
 
-    switchToFollower(rf, args.Term)
-
-    reply.VoteGranted = true
-    reply.Term = args.Term
-    DPrintf("%d投票给%d.", rf.me, args.CandidateId)
+    DPrintf("%d投票给%d, term: %d.", rf.me, args.CandidateId, args.Term)
 }
 
 // 处理AppendEntries请求(维持leader地位、log复制)
@@ -252,7 +256,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         rf.currentTerm = args.Term
     }
 
-    switchToFollower(rf, args.Term)
+    acceptLeadership(rf, args.Term)
 
     if success, errorMessage := checkPrevLog(rf, args); !success {
         reply.Success = false
@@ -288,10 +292,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func canVoteFor(raft *Raft, args *RequestVoteArgs) (canVote bool, reason string) {
-    if raft.currentTerm >= args.Term {
-        return false, fmt.Sprintf("currentTerm: %d >= args.Term: %d", raft.currentTerm, args.Term)
-    }
-
     if raft.currentIndex == 0 {
         return true, ""
     }
@@ -341,7 +341,7 @@ func replicateToLocal(raft *Raft, args *AppendEntriesArgs) {
     diff := 0
     for i := writeIndex + 1; i < raft.currentIndex; i++ {
         // 删除冲突的entry(term不一致)
-        if raft.log[i].Term != args.PrevLogTerm {
+        if raft.log[i].Term != args.Term {
             raft.log[i] = nil
             diff++
         }
@@ -487,6 +487,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     startServer(peers[me])
 
     switchToFollower(rf, rf.currentTerm)
+    rf.lastLeadershipHeartbeat = currentMills()
 
     go startLeadershipChecker(rf)
 
@@ -592,8 +593,13 @@ func switchToFollower(raft *Raft, term int) {
     }
 
     raft.state = FOLLOWER
-    raft.lastLeadershipHeartbeat = currentMills()
     raft.currentTerm = term
+}
+
+// 表示接受对方在term的领导，此方法区别于switchToFollower便是要设置最后收到心跳的时间
+func acceptLeadership(raft *Raft, term int) {
+    switchToFollower(raft, term)
+    raft.lastLeadershipHeartbeat = currentMills()
 }
 
 func requestVotes(raft *Raft) {
@@ -619,7 +625,6 @@ func requestVote(raft *Raft, voteArgs *RequestVoteArgs, index int) {
 
     // 请求发送失败，也就是得不到投票结果，raft算法应该可以自动处理此种异常
     if !ok {
-        DPrintf("%d向%d发送投票请求失败, term: %d.", raft.me, index, raft.currentTerm)
         return
     }
 
@@ -635,7 +640,9 @@ func handleVoteReply(index int, raft *Raft, voteArgs *RequestVoteArgs, voteReply
 
     // 说明当前server已经开始了新一轮candidate选举，老的投票结果不再关心
     if voteArgs.Term != raft.currentTerm {
-        DPrintf("%d丢弃%d的%d term同意票，当前term: %d.", raft.me, index, voteArgs.Term, raft.currentTerm)
+        DPrintf("%d的term已经改变, 丢弃%d的%d term投票结果，当前term: %d.",
+            raft.me, index, voteArgs.Term, raft.currentTerm,
+        )
         return
     }
 
@@ -646,7 +653,7 @@ func handleVoteReply(index int, raft *Raft, voteArgs *RequestVoteArgs, voteReply
 
     if voteReply.Term > raft.currentTerm {
         // 可能从leader、candidate转成follower
-        switchToFollower(raft, voteReply.Term)
+        acceptLeadership(raft, voteReply.Term)
     }
 }
 
@@ -750,7 +757,6 @@ func doHeartbeat(raft *Raft) {
             ok :=raft.sendAppendEntries(serverId, &args, &reply)
 
             if !ok {
-                DPrintf("%d向%d发送心跳失败, term: %d, traceId: %v.", raft.me, serverId, args.Term, args.TraceId)
                 return
             }
 
@@ -761,7 +767,7 @@ func doHeartbeat(raft *Raft) {
             if reply.Term > raft.currentTerm {
                 raft.mu.Lock()
                 DPrintf("%d维持leadership失败，不再发送心跳, traceId: %v.", raft.me, args.TraceId)
-                switchToFollower(raft, reply.Term)
+                acceptLeadership(raft, reply.Term)
                 raft.mu.Unlock()
                 return
             }
@@ -861,7 +867,7 @@ func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, t
                 raft.me, raft.currentTerm, serverId, reply.Term, traceId,
             )
             raft.mu.Lock()
-            switchToFollower(raft, reply.Term)
+            acceptLeadership(raft, reply.Term)
             raft.mu.Unlock()
             break
         }
