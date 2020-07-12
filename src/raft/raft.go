@@ -847,8 +847,10 @@ func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, t
         }
 
         // debug
-        result, _ := json.Marshal(args)
-        DPrintf("%d向%d发送log replicate请求成功, 参数: %v.", raft.me, serverId, string(result))
+        if isDebugEnabled() {
+            result, _ := json.Marshal(args)
+            DPrintf("%d向%d发送log replicate请求成功, 参数: %v.", raft.me, serverId, string(result))
+        }
 
         DPrintf(
             "Leader: %d收到%d的AppendEntries响应: traceId: %v, success: %v.",

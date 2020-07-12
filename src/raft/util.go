@@ -13,6 +13,10 @@ func DPrintf(format string, a ...interface{}) {
 	return
 }
 
+func isDebugEnabled() bool {
+	return Debug > 0
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
