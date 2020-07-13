@@ -17,8 +17,11 @@ package raft
 //
 
 import (
+    "bytes"
     "encoding/json"
     "fmt"
+    "labgob"
+    "log"
     "math/rand"
     "strconv"
     "sync"
@@ -54,6 +57,14 @@ const (
     KILLED
 )
 
+var idStateMap = map[int]string{
+    FOLLOWER: "Follower",
+    CANDIDATE: "Candidate",
+    LEADER: "Leader",
+    KILLED: "killed",
+}
+
+const LogEntryArraySize = 1024
 // 心跳发送间隔
 const AppendEntriesTimeInterval = time.Millisecond * 75
 const MaxQueuedEntryCount = 50
@@ -73,9 +84,11 @@ type Raft struct {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
 
+    // 持久化变量区
     currentTerm int
-    votedFor    map[int]bool
+    state           int
     log         []*LogEntry
+    // 持久化区结束
 
     commitIndex int
     lastApplied int
@@ -86,6 +99,7 @@ type Raft struct {
     matchIndex []int
 
     // 自定义属性(paper未定义的)
+    voteGranted map[int]bool
     // 定时发送心跳，leader专属
     heartbeatTicker         *time.Ticker
     heartbeatChan           chan bool
@@ -93,7 +107,7 @@ type Raft struct {
     // 收到客户端请求时，缓存一定数量再向follower发起replicate请求
     queuedEntryCount int
     // 上一次收到客户端请求并进行缓存的时间(毫秒)
-    lastQueueEntryTime           int64
+    lastQueueEntryTime int64
     // 定期检查排队的客户端请求是否已过期
     queuedEntryExpireCheckTicker *time.Ticker
     queuedEntryExpireCheckChan   chan bool
@@ -101,7 +115,6 @@ type Raft struct {
     // 当前Server选取过期时间(毫秒)
     electionTimeout int64
     currentIndex    int
-    state           int
     // 通知commit协程起来干活啦
     commitCondition *sync.Cond
     applyCh         chan ApplyMsg
@@ -128,13 +141,27 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
     // Your code here (2C).
-    // Example:
-    // w := new(bytes.Buffer)
-    // e := labgob.NewEncoder(w)
-    // e.Encode(rf.xxx)
-    // e.Encode(rf.yyy)
-    // data := w.Bytes()
-    // rf.persister.SaveRaftState(data)
+
+    writer := new(bytes.Buffer)
+    encoder := labgob.NewEncoder(writer)
+    err := encoder.Encode(rf.currentTerm)
+    if err != nil {
+        panic(err)
+    }
+
+    err = encoder.Encode(rf.state)
+    if err != nil {
+        panic(err)
+    }
+
+    logArray := rf.log[0:rf.currentIndex]
+    err = encoder.Encode(logArray)
+    if err != nil {
+        panic(err)
+    }
+
+    data := writer.Bytes()
+    rf.persister.SaveRaftState(data)
 }
 
 //
@@ -145,18 +172,34 @@ func (rf *Raft) readPersist(data []byte) {
         return
     }
     // Your code here (2C).
-    // Example:
-    // r := bytes.NewBuffer(data)
-    // d := labgob.NewDecoder(r)
-    // var xxx
-    // var yyy
-    // if d.Decode(&xxx) != nil ||
-    //    d.Decode(&yyy) != nil {
-    //   error...
-    // } else {
-    //   rf.xxx = xxx
-    //   rf.yyy = yyy
-    // }
+
+    reader := bytes.NewBuffer(data)
+    decoder := labgob.NewDecoder(reader)
+
+    var currentTerm int
+    err := decoder.Decode(&currentTerm)
+    if err != nil {
+        panic(err)
+    }
+
+    var state int
+    err = decoder.Decode(&state)
+    if err != nil {
+        panic(err)
+    }
+
+    var logEntries []*LogEntry
+    err = decoder.Decode(&logEntries)
+    if err != nil {
+        panic(err)
+    }
+
+    rf.currentTerm = currentTerm
+    rf.state = state
+    // 还是保持数组1024的长度
+    array := make([]*LogEntry, LogEntryArraySize)
+    copy(array, logEntries)
+    rf.log = array
 }
 
 //
@@ -220,6 +263,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // 这里虽然转为follower状态，但是不能更新心跳接收时间，否则会抑制当前server选举发起，或许在某种意义上说，
     // 只有要更新心跳时间时才算认可了对方是leader
     switchToFollower(rf, args.Term)
+    if reply.Term != args.Term {
+        rf.persist()
+    }
 
     if canVote, reason := canVoteFor(rf, args); !canVote {
         reply.VoteGranted = false
@@ -415,6 +461,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     }
 
     savedIndex := saveLogEntry(command, rf)
+    rf.persist()
 
     shouldStartAgreement := false
     logIndex := 0
@@ -474,38 +521,76 @@ func (rf *Raft) Kill() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
     persister *Persister, applyCh chan ApplyMsg) *Raft {
-    rf := &Raft{}
-    rf.peers = peers
-    rf.persister = persister
-    rf.me = me
-    rf.applyCh = applyCh
+    raft := &Raft{}
+    raft.peers = peers
+    raft.persister = persister
+    raft.me = me
+    raft.applyCh = applyCh
+
+    setCommonStates(raft)
 
     // Your initialization code here (2A, 2B, 2C).
 
-    initRaft(rf)
+    // initialize from state persisted before a crash
+    raft.readPersist(persister.ReadRaftState())
+    
+    if raft.currentTerm > 0 {
+        // 说明存在持久化的状态并且读取成功
+        recoverFromPersistedState(raft)
+    } else {
+        asABranNewFollower(raft)
+    }
 
+    startLogCommitter(raft)
     startServer(peers[me])
 
-    switchToFollower(rf, rf.currentTerm)
-    rf.lastLeadershipHeartbeat = currentMills()
-
-    go startLeadershipChecker(rf)
-
-    // initialize from state persisted before a crash
-    rf.readPersist(persister.ReadRaftState())
-
-    return rf
+    return raft
 }
 
-// 对raft进行一些自定义的初始化工作
-func initRaft(raft *Raft) {
-    raft.currentTerm = 0
-
-    //lab 2B
+func setCommonStates(raft *Raft) {
     raft.currentIndex = 0
     raft.commitIndex = -1
     raft.lastApplied = -1
-    raft.log = make([]*LogEntry, 1024)
+}
+
+func recoverFromPersistedState(raft *Raft) {
+    switch raft.state {
+    case FOLLOWER:
+        recoverAsFollower(raft)
+        break
+    case CANDIDATE:
+        recoverAsCandidate(raft)
+        break
+    case LEADER:
+        recoverAsLeader(raft)
+        break
+    case KILLED:
+        log.Fatalf("不能从KILLED状态恢复!")
+    }
+}
+
+func recoverAsLeader(raft *Raft) {
+    doSwitchToLeader(raft)
+}
+
+func recoverAsCandidate(raft *Raft) {
+    // paper并没有说要持久化投票记录信息，所以恢复为follower
+    recoverAsFollower(raft)
+}
+
+func recoverAsFollower(raft *Raft) {
+    switchToFollower(raft, raft.currentTerm)
+    raft.lastLeadershipHeartbeat = currentMills()
+    go startLeadershipChecker(raft)
+}
+
+func asABranNewFollower(raft *Raft) {
+    raft.log = make([]*LogEntry, LogEntryArraySize)
+    raft.currentTerm = 0
+    recoverAsFollower(raft)
+}
+
+func startLogCommitter(raft *Raft) {
     raft.commitCondition = sync.NewCond(new(sync.Mutex))
     go commitLog(raft)
 }
@@ -567,8 +652,8 @@ func randomElectionTimeout(raft *Raft) time.Duration {
 func elect(raft *Raft) {
     switchToCandidate(raft)
 
-    raft.votedFor = make(map[int]bool)
-    raft.votedFor[raft.me] = true
+    raft.voteGranted = make(map[int]bool)
+    raft.voteGranted[raft.me] = true
 
     requestVotes(raft)
 }
@@ -577,6 +662,7 @@ func switchToCandidate(raft *Raft) {
     raft.mu.Lock()
     raft.state = CANDIDATE
     raft.currentTerm++
+    raft.persist()
     raft.mu.Unlock()
 }
 
@@ -598,8 +684,19 @@ func switchToFollower(raft *Raft, term int) {
 
 // 表示接受对方在term的领导，此方法区别于switchToFollower便是要设置最后收到心跳的时间
 func acceptLeadership(raft *Raft, term int) {
+    oldState := raft.state
+    oldTerm := raft.currentTerm
+
     switchToFollower(raft, term)
     raft.lastLeadershipHeartbeat = currentMills()
+
+    if oldState != FOLLOWER || oldTerm != term {
+        DPrintf(
+            "%d的AcceptLeadership触发持久化, 老状态: %s, 新状态: Follower, 老term: %d, 新term: %d.",
+            raft.me, idStateMap[oldState], oldTerm, term,
+        )
+        raft.persist()
+    }
 }
 
 func requestVotes(raft *Raft) {
@@ -661,25 +758,26 @@ func handleVoteReply(index int, raft *Raft, voteArgs *RequestVoteArgs, voteReply
 // 此函数一定要在持有锁的情况下调用
 func switchToLeaderIfNecessary(raft *Raft, index int) {
     DPrintf("%d收到%d的赞成响应, term: %d.", raft.me, index, raft.currentTerm)
-    raft.votedFor[index] = true
+    raft.voteGranted[index] = true
     if !hasReceivedMajorityVote(raft) {
         return
     }
 
+    DPrintf("%d选举成功，term: %d, 触发状态持久化.", raft.me, raft.currentTerm)
     doSwitchToLeader(raft)
+    raft.persist()
 }
 
 func hasReceivedMajorityVote(raft *Raft) bool {
     total := len(raft.peers)
-    received := len(raft.votedFor)
+    received := len(raft.voteGranted)
 
     return total / received < 2
 }
 
 func doSwitchToLeader(raft *Raft) {
     raft.state = LEADER
-    raft.votedFor = nil
-    DPrintf("%d选举成功，term: %d.", raft.me, raft.currentTerm)
+    raft.voteGranted = nil
 
     peerCount := len(raft.peers)
     raft.nextIndex = make([]int, peerCount)
