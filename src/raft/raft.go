@@ -196,6 +196,7 @@ func (rf *Raft) readPersist(data []byte) {
 
     rf.currentTerm = currentTerm
     rf.state = state
+    rf.currentIndex = len(logEntries)
     // 还是保持数组1024的长度
     array := make([]*LogEntry, LogEntryArraySize)
     copy(array, logEntries)
@@ -533,9 +534,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
     // initialize from state persisted before a crash
     raft.readPersist(persister.ReadRaftState())
-    
+
     if raft.currentTerm > 0 {
         // 说明存在持久化的状态并且读取成功
+        DPrintf(
+            "%d读取到持久化状态, currentTerm: %d, state: %s, log数组日志数: %d.",
+            me, raft.currentTerm, idStateMap[raft.state], raft.currentIndex,
+        )
         recoverFromPersistedState(raft)
     } else {
         asABranNewFollower(raft)
