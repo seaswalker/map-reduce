@@ -9,13 +9,13 @@ package raft
 //
 
 import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -495,7 +495,7 @@ loop:
 			continue loop
 		}
 
-		threshold := (iters+1+3)*3
+		threshold := (iters + 1 + 3) * 3
 		if total2-total1 > threshold {
 			t.Fatalf("too many RPCs (%v) for %v entries, threshold: %d\n", total2-total1, iters, threshold)
 		}
@@ -790,7 +790,17 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
-	cfg.one(rand.Int()%10000, servers, true)
+	// TODO debug
+	command := rand.Int() % 10000
+	DPrintf("高能预警：最后一波命令: %d要提交了!", command)
+	for i := 0; i < servers; i++ {
+		raft := cfg.rafts[i]
+		DPrintf(
+			"Server: %d, state: %d, term: %d, currentIndex: %d, commitIndex: %d, lastLogentry: %#v.",
+			i, raft.state, raft.currentTerm, raft.currentIndex, raft.commitIndex, raft.log[raft.currentIndex-1],
+		)
+	}
+	cfg.one(command, servers, true)
 
 	cfg.end()
 }
