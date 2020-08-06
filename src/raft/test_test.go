@@ -790,7 +790,6 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
-	// TODO debug
 	command := rand.Int() % 10000
 	DPrintf("高能预警：最后一波命令: %d要提交了!", command)
 	for i := 0; i < servers; i++ {
@@ -926,7 +925,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 	lastIndex := cfg.one(rand.Int(), servers, true)
 
 	really := make([]int, lastIndex+1)
-	for index := 1; index <= lastIndex; index++ {
+	for index := 0; index <= lastIndex; index++ {
 		v := cfg.wait(index, servers, -1)
 		if vi, ok := v.(int); ok {
 			really = append(really, vi)
@@ -943,7 +942,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 			}
 		}
 		if ok == false {
-			cfg.t.Fatalf("didn't find a value")
+			cfg.t.Fatalf("didn't find a value, v1: %d", v1)
 		}
 	}
 

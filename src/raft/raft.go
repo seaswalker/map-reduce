@@ -63,14 +63,14 @@ var idStateMap = map[int]string{
 	KILLED:    "killed",
 }
 
-const LogEntryArraySize = 1024
+const logEntryArraySize = 102400
 
 // 心跳发送间隔
-const AppendEntriesTimeInterval = time.Millisecond * 75
-const MaxQueuedEntryCount = 50
+const appendEntriesTimeInterval = time.Millisecond * 75
+const maxQueuedEntryCount = 50
 
 // 毫秒
-const QueuedEntryExpireTime = 20
+const queuedEntryExpireTime = 20
 
 //
 // A Go object implementing a single Raft peer.
@@ -198,8 +198,8 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.currentTerm = currentTerm
 	rf.state = state
 	rf.currentIndex = len(logEntries)
-	// 还是保持数组1024的长度
-	array := make([]*LogEntry, LogEntryArraySize)
+	// 还是保持数组原有的长度
+	array := make([]*LogEntry, logEntryArraySize)
 	copy(array, logEntries)
 	rf.log = array
 }
@@ -218,13 +218,13 @@ type RequestVoteArgs struct {
 
 type AppendEntriesArgs struct {
 	Term         int
-	LeaderId     int
+	LeaderID     int
 	PreLogIndex  int
 	PrevLogTerm  int
 	Entries      []*LogEntry
 	LeaderCommit int
 	// debug
-	TraceId string
+	TraceID string
 }
 
 //
@@ -240,6 +240,8 @@ type RequestVoteReply struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// 告诉leader下次请求时发送的log数组的最低index是NextIndex
+	NextIndex int
 }
 
 //
@@ -293,7 +295,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		DPrintf(
 			"%d拒绝%d的AppendEntries请求, traceId: %v, 原因: %v.",
-			rf.me, args.LeaderId, args.TraceId,
+			rf.me, args.LeaderID, args.TraceID,
 			fmt.Sprintf("当前term: %d > 请求term: %d", rf.currentTerm, args.Term),
 		)
 		return
@@ -306,16 +308,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	acceptLeadership(rf, args.Term)
 
-	if success, errorMessage := checkPrevLog(rf, args); !success {
+	if success, nextIndex, errorMessage := checkPrevLog(rf, args); !success {
 		reply.Success = false
-		DPrintf("%d拒绝%d的AppendEntries请求, traceId: %v, 原因: %v.",
-			rf.me, args.LeaderId, args.TraceId, errorMessage,
+		reply.NextIndex = nextIndex
+		DPrintf("%d拒绝%d的AppendEntries请求, nextIndex: %d, traceId: %v, 原因: %v.",
+			rf.me, args.LeaderID, nextIndex, args.TraceID, errorMessage,
 		)
 		return
 	}
 
 	if args.Entries != nil {
 		replicateToLocal(rf, args)
+		rf.persist()
 	}
 
 	// commit
@@ -325,7 +329,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if actualCommitIndex > rf.commitIndex {
 			DPrintf(
 				"%d commitIndex: %d, leaderIndex: %d, 提交到：%d, traceId: %v.",
-				rf.me, rf.commitIndex, args.LeaderCommit, actualCommitIndex, args.TraceId,
+				rf.me, rf.commitIndex, args.LeaderCommit, actualCommitIndex, args.TraceID,
 			)
 			rf.commitIndex = actualCommitIndex
 			signalCommit(rf)
@@ -335,7 +339,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	DPrintf(
 		"%d接受%d的AppendEntries请求, traceId: %v, leader term: %d, 当前term: %d.",
-		rf.me, args.LeaderId, args.TraceId, args.Term, rf.currentTerm,
+		rf.me, args.LeaderID, args.TraceID, args.Term, rf.currentTerm,
 	)
 }
 
@@ -362,21 +366,26 @@ func canVoteFor(raft *Raft, args *RequestVoteArgs) (canVote bool, reason string)
 	return true, ""
 }
 
-func checkPrevLog(raft *Raft, args *AppendEntriesArgs) (success bool, reason string) {
-	if args.PreLogIndex >= raft.currentIndex {
-		return false, fmt.Sprintf("PrelogIndex: %d >= currentIndex: %d", args.PreLogIndex, raft.currentIndex)
+func checkPrevLog(raft *Raft, args *AppendEntriesArgs) (success bool, nextIndex int, reason string) {
+	if args.PreLogIndex == -1 {
+		return true, -1, ""
 	}
 
-	if args.PreLogIndex == -1 {
-		return true, ""
+	if args.PreLogIndex >= raft.currentIndex {
+		// leader比当前follower日志更多，告诉leader当前follower最新日志的index，下次leader在此index开始
+		return false, raft.currentIndex, fmt.Sprintf("PrelogIndex: %d >= currentIndex: %d", args.PreLogIndex, raft.currentIndex)
 	}
 
 	entry := raft.log[args.PreLogIndex]
 	if entry.Term != args.PrevLogTerm {
-		return false, fmt.Sprintf("PreLogTerm: %d != leaderPrevLogTerm: %d", entry.Term, args.PrevLogTerm)
+		// 找到非当前term的最新index
+		index := args.PreLogIndex - 1
+		for ; index >= 0 && raft.log[index].Term == entry.Term; index-- {
+		}
+		return false, index + 1, fmt.Sprintf("PreLogTerm: %d != leaderPrevLogTerm: %d", entry.Term, args.PrevLogTerm)
 	}
 
-	return true, ""
+	return true, -1, ""
 }
 
 func replicateToLocal(raft *Raft, args *AppendEntriesArgs) {
@@ -470,7 +479,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.queuedEntryCount++
 	rf.lastQueueEntryTime = currentMills()
 
-	if rf.queuedEntryCount >= MaxQueuedEntryCount {
+	if rf.queuedEntryCount >= maxQueuedEntryCount {
 		shouldStartAgreement = true
 		logIndex = rf.currentIndex - 1
 		DPrintf("客户端请求: %v导致%d缓存的请求数: %d已达上限, 立即开始replicate.", command, rf.me, rf.queuedEntryCount)
@@ -591,7 +600,7 @@ func recoverAsFollower(raft *Raft) {
 }
 
 func asABranNewFollower(raft *Raft) {
-	raft.log = make([]*LogEntry, LogEntryArraySize)
+	raft.log = make([]*LogEntry, logEntryArraySize)
 	raft.currentTerm = 0
 	recoverAsFollower(raft)
 }
@@ -800,11 +809,11 @@ func doSwitchToLeader(raft *Raft) {
 	// 必须在持有锁的情况下初始化ticker，不能放在下面的协程里面。考虑如果不这样做：
 	// leader选举成功，执行到这里释放锁，此时集群中投否决票(term更高)的响应到来，得到锁，去执行switchFollower方法，
 	// 但由于ticker尚未初始化，会导致对ticker stop操作异常(nil)
-	raft.heartbeatTicker = time.NewTicker(AppendEntriesTimeInterval)
+	raft.heartbeatTicker = time.NewTicker(appendEntriesTimeInterval)
 	raft.heartbeatChan = make(chan bool, 1)
 
 	raft.queuedEntryCount = 0
-	raft.queuedEntryExpireCheckTicker = time.NewTicker(QueuedEntryExpireTime)
+	raft.queuedEntryExpireCheckTicker = time.NewTicker(queuedEntryExpireTime)
 	raft.queuedEntryExpireCheckChan = make(chan bool, 1)
 
 	go heartbeat(raft)
@@ -834,12 +843,12 @@ func doHeartbeat(raft *Raft) {
 			continue
 		}
 
-		serverId := index
+		serverID := index
 
 		go func() {
 			raft.mu.Lock()
 			prevLogIndex := raft.currentIndex - 1
-			traceId := randstring(10)
+			traceID := randstring(10)
 			prevLogTerm := -1
 			if prevLogIndex >= 0 {
 				prevLogTerm = raft.log[prevLogIndex].Term
@@ -848,19 +857,19 @@ func doHeartbeat(raft *Raft) {
 
 			args := AppendEntriesArgs{
 				Term:         raft.currentTerm,
-				LeaderId:     raft.me,
+				LeaderID:     raft.me,
 				PreLogIndex:  prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
 				Entries:      nil,
 				LeaderCommit: raft.commitIndex,
-				TraceId:      traceId,
+				TraceID:      traceID,
 			}
 
 			reply := AppendEntriesReply{}
 
-			DPrintf("%d向%d发送心跳: %#v.", raft.me, serverId, args)
+			DPrintf("%d向%d发送心跳: %#v.", raft.me, serverID, args)
 
-			ok := raft.sendAppendEntries(serverId, &args, &reply)
+			ok := raft.sendAppendEntries(serverID, &args, &reply)
 
 			if !ok {
 				return
@@ -872,7 +881,7 @@ func doHeartbeat(raft *Raft) {
 
 			if reply.Term > raft.currentTerm {
 				raft.mu.Lock()
-				DPrintf("%d维持leadership失败，不再发送心跳, traceId: %v.", raft.me, args.TraceId)
+				DPrintf("%d维持leadership失败，不再发送心跳, traceId: %v.", raft.me, args.TraceID)
 				acceptLeadership(raft, reply.Term)
 				raft.mu.Unlock()
 				return
@@ -882,7 +891,7 @@ func doHeartbeat(raft *Raft) {
 				return
 			}
 			// follower和leader的日志不匹配，开始entry弥合
-			decrementNextIndexAndRetry(raft, serverId, traceId, prevLogIndex)
+			decreaseNextIndexAndRetry(raft, serverID, reply.NextIndex, traceID, prevLogIndex)
 		}()
 	}
 }
@@ -903,12 +912,12 @@ func saveLogEntry(command interface{}, raft *Raft) int {
 
 // 当前为leader，开始向follower发送AppendEntries消息
 func startAgreement(raft *Raft, logIndex int) int {
-	for serverId := range raft.peers {
-		if serverId == raft.me {
+	for serverID := range raft.peers {
+		if serverID == raft.me {
 			continue
 		}
-		traceId := strconv.Itoa(logIndex) + "-" + randstring(10)
-		go replicateToFollower(serverId, logIndex-1, logIndex, raft, traceId)
+		traceID := strconv.Itoa(logIndex) + "-" + randstring(10)
+		go replicateToFollower(serverID, logIndex-1, logIndex, raft, traceID)
 	}
 
 	return logIndex
@@ -919,7 +928,7 @@ func startAgreement(raft *Raft, logIndex int) int {
 // 2. 如果1中的请求被follower拒绝，那么再从raft.log[raft.nextId[followerId] - 1]中取(递减一)，这便是寻找leader和follower都同意
 //    的log entry的过程
 // 如果不按照上述逻辑，是无法通过TestRejoin2B单元测试的
-func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, traceId string) {
+func replicateToFollower(serverID int, lowBound int, logIndex int, raft *Raft, traceID string) {
 	var entries []*LogEntry
 	if logIndex >= lowBound {
 		// slice: [)
@@ -928,12 +937,12 @@ func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, t
 
 	args := AppendEntriesArgs{
 		Term:         raft.currentTerm,
-		LeaderId:     raft.me,
+		LeaderID:     raft.me,
 		PreLogIndex:  lowBound,
 		PrevLogTerm:  -1,
 		Entries:      entries,
 		LeaderCommit: raft.commitIndex,
-		TraceId:      traceId,
+		TraceID:      traceID,
 	}
 	if lowBound >= 0 {
 		args.PrevLogTerm = raft.log[lowBound].Term
@@ -945,7 +954,7 @@ func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, t
 	// 但此时如果有其它replicate请求现在才开始，就会带着最新的term去请求，这会导致覆盖掉其它server已经commit的log，所以这里需要检查state
 	for raft.state == LEADER {
 
-		ok := raft.sendAppendEntries(serverId, &args, &reply)
+		ok := raft.sendAppendEntries(serverID, &args, &reply)
 
 		if !ok {
 			// 网络问题不可达，无限重试
@@ -962,12 +971,12 @@ func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, t
 			}
 			DPrintf(
 				"%d向%d发送log replicate请求成功, 响应: %v, term: %d, prevLogIndex: %d, prevLogTerm: %d, firstLogEntry: %#v, lastLogEntry: %#v, traceId: %v.",
-				raft.me, serverId, reply.Success, args.Term, args.PreLogIndex, args.PrevLogTerm, firstLogEntry, lastLogEntry, args.TraceId,
+				raft.me, serverID, reply.Success, args.Term, args.PreLogIndex, args.PrevLogTerm, firstLogEntry, lastLogEntry, args.TraceID,
 			)
 		}
 
 		if reply.Success {
-			commitLogIfPossible(logIndex, serverId, raft)
+			commitLogIfPossible(logIndex, serverID, raft)
 			break
 		}
 
@@ -975,7 +984,7 @@ func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, t
 		// 这种情况下变为follower，等待下一轮重新选举
 		if reply.Term > raft.currentTerm {
 			DPrintf("%d的term: %d小于follower%d的term: %d，转为follower, traceId: %v.",
-				raft.me, raft.currentTerm, serverId, reply.Term, traceId,
+				raft.me, raft.currentTerm, serverID, reply.Term, traceID,
 			)
 			raft.mu.Lock()
 			acceptLeadership(raft, reply.Term)
@@ -985,24 +994,24 @@ func replicateToFollower(serverId int, lowBound int, logIndex int, raft *Raft, t
 
 		if args.Term != raft.currentTerm {
 			// term已经变了，不要再重试了
-			DPrintf("Term已经改变, 退出重试, traceId: %v.", traceId)
+			DPrintf("Term已经改变, 退出重试, traceId: %v.", traceID)
 			break
 		}
 
 		// 递归
-		decrementNextIndexAndRetry(raft, serverId, traceId, logIndex)
+		decreaseNextIndexAndRetry(raft, serverID, reply.NextIndex, traceID, logIndex)
 		break
 	}
 }
 
-func commitLogIfPossible(logIndex int, serverId int, raft *Raft) {
+func commitLogIfPossible(logIndex int, serverID int, raft *Raft) {
 	raft.mu.Lock()
 	defer raft.mu.Unlock()
 
-	if logIndex > raft.matchIndex[serverId] {
+	if logIndex > raft.matchIndex[serverID] {
 		// 有可能已经被更高index的请求顺带在follower上保存了副本，那么我们不需要再修改下面两个值
-		raft.matchIndex[serverId] = logIndex
-		raft.nextIndex[serverId] = logIndex + 1
+		raft.matchIndex[serverID] = logIndex
+		raft.nextIndex[serverID] = logIndex + 1
 	}
 
 	if logIndex <= raft.commitIndex {
@@ -1070,7 +1079,7 @@ func checkIfQueuedEntryExpired(raft *Raft) {
 			}
 
 			now := currentMills()
-			if now-raft.lastQueueEntryTime >= QueuedEntryExpireTime && raft.queuedEntryCount > 0 {
+			if now-raft.lastQueueEntryTime >= queuedEntryExpireTime && raft.queuedEntryCount > 0 {
 				raft.lastQueueEntryTime = now
 				logIndex := raft.currentIndex - 1
 				DPrintf("缓存的%d个客户端请求已过期, 开始replicate.", raft.queuedEntryCount)
@@ -1098,16 +1107,14 @@ func signalCommit(raft *Raft) {
 	raft.commitCondition.L.Unlock()
 }
 
-func decrementNextIndexAndRetry(raft *Raft, serverId int, traceId string, logIndex int) {
-	nextLowBound := -1
+func decreaseNextIndexAndRetry(raft *Raft, serverID int, nextIndex int, traceID string, logIndex int) {
 	raft.mu.Lock()
-	// 可能有多个协程同时失败(当leader在短时间内收到多个请求时)，不能让nextIndex减为负数
-	if raft.nextIndex[serverId] > 0 {
-		nextLowBound = raft.nextIndex[serverId] - 1
-		raft.nextIndex[serverId] = nextLowBound
-		DPrintf("把follower: %d的nextIndex改为: %d, traceId: %v.", serverId, nextLowBound, traceId)
+	if raft.nextIndex[serverID] > nextIndex {
+		raft.nextIndex[serverID] = nextIndex
+		DPrintf("把follower: %d的nextIndex改为: %d, traceId: %v.", serverID, nextIndex, traceID)
 	}
 	raft.mu.Unlock()
 
-	replicateToFollower(serverId, nextLowBound, logIndex, raft, traceId)
+	// nextIndex是向follower发送log数组的界限，最小为零，而replicateToFollower的参数lowBound是prevLogIndex，所以可以为-1
+	replicateToFollower(serverID, nextIndex-1, logIndex, raft, traceID)
 }
