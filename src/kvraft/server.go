@@ -17,11 +17,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Operation string
+	Key       string
+	Value     string
 }
 
 type KVServer struct {
@@ -33,15 +35,71 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dataStore map[string]string
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	command := &Op{Operation: "Get", Key: args.Key}
+	_, _, success := kv.rf.Start(command)
+	if !success {
+		reply.WrongLeader = true
+		return
+	}
+
+	for {
+		applyMessage := <-kv.applyCh
+		if applyMessage.Command != command {
+			continue
+		}
+		break
+	}
+
+	reply.Value = applyCommand(command, kv)
+}
+
+func applyCommand(op *Op, kv *KVServer) string {
+	switch op.Operation {
+	case "Get":
+		return kv.dataStore[op.Key]
+	case "Put":
+		kv.dataStore[op.Key] = op.Value
+		break
+	case "Append":
+		oldValue := kv.dataStore[op.Key]
+		if oldValue == "" {
+			kv.dataStore[op.Key] = op.Value
+		} else {
+			kv.dataStore[op.Key] = oldValue + op.Value
+		}
+	}
+
+	return ""
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	command := &Op{Operation: args.Op, Key: args.Key, Value: args.Value}
+	_, _, success := kv.rf.Start(command)
+	if !success {
+		reply.WrongLeader = true
+		return
+	}
+
+	for {
+		applyMessage := <-kv.applyCh
+		if applyMessage.Command != command {
+			continue
+		}
+		break
+	}
+
+	applyCommand(command, kv)
 }
 
 //
@@ -84,6 +142,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	kv.dataStore = make(map[string]string)
 	return kv
 }
