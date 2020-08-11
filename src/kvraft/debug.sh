@@ -10,7 +10,7 @@ i=0
 count=$2
 while (( $i < $count )) 
 do
-    `go test -count=1 -run $1 > out`
+    `go test -count=1 -timeout=30s kvraft -run $1 > out`
     line=`tail -1 out`
     let i+=1
 

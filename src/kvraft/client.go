@@ -45,11 +45,13 @@ func (ck *Clerk) Get(key string) string {
 	if key == "" {
 		return ""
 	}
-	getArgs := GetArgs{Key: key}
+	getArgs := GetArgs{Key: key, ID: nrand()}
 	result := ""
 	for {
 		reply := GetReply{}
 		server := ck.servers[ck.lastLeaderIndex]
+		DPrintf("Client提交Get请求, id: %d, key: %s.", getArgs.ID, key)
+
 		success := server.Call("KVServer.Get", &getArgs, &reply)
 		if !success || reply.WrongLeader || reply.Err != "" {
 			ck.lastLeaderIndex++
@@ -77,12 +79,16 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ID: nrand()}
 
 	for {
 		reply := PutAppendReply{}
 		server := ck.servers[ck.lastLeaderIndex]
+
+		DPrintf("Client提交%s请求, id: %d, key: %s, value: %s.", op, args.ID, key, value)
 		success := server.Call("KVServer.PutAppend", &args, &reply)
+		DPrintf("%d请求结果: %v, 响应: %#v.", args.ID, success, reply)
+
 		if !success || reply.WrongLeader || reply.Err != "" {
 			ck.lastLeaderIndex++
 			if ck.lastLeaderIndex == len(ck.servers) {

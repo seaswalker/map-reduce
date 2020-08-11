@@ -72,6 +72,12 @@ const maxQueuedEntryCount = 50
 // 毫秒
 const queuedEntryExpireTime = 20
 
+// LOSELEADERSHIPAPPLYMESSAGE 表示当Raft.applyChan的监听者检测到此消息就说明对应的raft节点已不再是leader
+var LOSELEADERSHIPAPPLYMESSAGE = ApplyMsg{
+	CommandValid: false,
+	Command:      "LOSE_LEADERSHIP",
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -117,8 +123,9 @@ type Raft struct {
 	electionTimeout int64
 	currentIndex    int
 	// 通知commit协程起来干活啦
-	commitCondition *sync.Cond
-	applyCh         chan ApplyMsg
+	commitCondition          *sync.Cond
+	applyCh                  chan ApplyMsg
+	needNotifyLoseLeaderShip bool
 }
 
 type LogEntry struct {
@@ -277,6 +284,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	rf.lastLeadershipHeartbeat = currentMills()
 	DPrintf("%d投票给%d, term: %d.", rf.me, args.CandidateId, args.Term)
 }
 
@@ -690,7 +698,12 @@ func switchToFollower(raft *Raft, term int) {
 		raft.queuedEntryExpireCheckTicker.Stop()
 		raft.queuedEntryExpireCheckChan <- true
 
+		raft.needNotifyLoseLeaderShip = true
+		signalCommit(raft)
+
 		go startLeadershipChecker(raft)
+
+		DPrintf("%d失去leadership, 对方term: %d.", raft.me, term)
 	}
 
 	raft.state = FOLLOWER
@@ -1062,6 +1075,12 @@ func commitLog(raft *Raft) {
 			}
 
 			raft.applyCh <- applyMessage
+		}
+
+		if raft.needNotifyLoseLeaderShip {
+			raft.applyCh <- LOSELEADERSHIPAPPLYMESSAGE
+			raft.needNotifyLoseLeaderShip = false
+			DPrintf("%d发送lose leadership消息成功.", raft.me)
 		}
 
 		raft.lastApplied = raft.commitIndex
