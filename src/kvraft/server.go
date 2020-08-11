@@ -6,17 +6,15 @@ import (
 	"labrpc"
 	"log"
 	"raft"
+	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 const Debug = 1
+const loseLeadershipIndex = -1
 
-// 全局(所有server共用)的请求过滤器，key为请求ID，如果ID在此map中存在，那么说明当前请求已被处理过，用以防止对同一个请求的重复处理
-// 比如server实际上已经处理完，但client没有收到响应(网络超时)，在这种情形下client会重复发送请求
-var filter map[int64]bool = make(map[int64]bool)
-
-// 全局的数据存储
-var dataStore map[string]string = make(map[string]string)
+var poison = raft.ApplyMsg{}
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -32,6 +30,7 @@ type Op struct {
 	Operation string
 	Key       string
 	Value     string
+	RequestID int64
 }
 
 type KVServer struct {
@@ -42,16 +41,28 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	dataStore map[string]string
+	// RPC handler监听某个index的日志提交
+	logCommitListener      map[int]chan logCommitListenReply
+	logCommitListenerLock  sync.Mutex
+	isKilled               atomic.Value
+	duplicateRequestFilter map[int64]bool
 }
 
+type logCommitListenReply struct {
+	index int
+	// 只有get请求才不为空
+	value string
+}
+
+// Get 强一致性读
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("KVServer: %d收到请求: %d.", kv.me, args.ID)
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	command := &Op{Operation: "Get", Key: args.Key}
+	command := &Op{Operation: "Get", Key: args.Key, RequestID: args.ID}
 	index, _, success := kv.rf.Start(command)
 	DPrintf("%d向Raft提交Get操作, id: %d, key: %s, 结果: %v.", kv.me, args.ID, args.Key, success)
 
@@ -60,43 +71,21 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	var applyMessage raft.ApplyMsg
-	for {
-		applyMessage = <-kv.applyCh
-		if applyMessage != raft.LOSELEADERSHIPAPPLYMESSAGE && applyMessage.CommandIndex != index {
-			continue
-		}
-		break
-	}
+	ch := make(chan logCommitListenReply)
+	registerLogCommitListener(kv, index, ch)
 
-	if applyMessage.Command == command {
-		reply.Value = applyCommand(command, kv)
-		DPrintf("%d get %s: %s, id: %d.", kv.me, args.Key, reply.Value, args.ID)
-	} else {
+	listenReply := <-ch
+
+	if listenReply.index == loseLeadershipIndex {
 		reply.Err = Err(fmt.Sprintf("Leader: %d has losed leadership.", kv.me))
 		DPrintf("%d不再是leader, 请求: %d需要重试.", kv.me, args.ID)
+	} else {
+		reply.Value = listenReply.value
+		DPrintf("%d get %s: %s, id: %d.", kv.me, args.Key, reply.Value, args.ID)
 	}
 }
 
-func applyCommand(op *Op, kv *KVServer) string {
-	switch op.Operation {
-	case "Get":
-		return dataStore[op.Key]
-	case "Put":
-		dataStore[op.Key] = op.Value
-		break
-	case "Append":
-		oldValue := dataStore[op.Key]
-		if oldValue == "" {
-			dataStore[op.Key] = op.Value
-		} else {
-			dataStore[op.Key] = oldValue + op.Value
-		}
-	}
-
-	return ""
-}
-
+// PutAppend 如果key存在，那么追加(字符串拼接)，反之保存即可
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("KVServer: %d收到请求: %d.", kv.me, args.ID)
 
@@ -109,11 +98,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	if filter[args.ID] {
+	kv.logCommitListenerLock.Lock()
+	requestHandled := kv.duplicateRequestFilter[args.ID]
+	kv.logCommitListenerLock.Unlock()
+
+	if requestHandled {
 		return
 	}
 
-	command := &Op{Operation: args.Op, Key: args.Key, Value: args.Value}
+	command := &Op{Operation: args.Op, Key: args.Key, Value: args.Value, RequestID: args.ID}
 	index, _, success := kv.rf.Start(command)
 	DPrintf("%d向Raft提交%s请求, id: %d, key: %s, value: %s, 结果: %v.", kv.me, args.Op, args.ID, args.Key, args.Value, success)
 
@@ -124,22 +117,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	DPrintf("%d开始等待%d提交, 请求ID: %d.", kv.me, index, args.ID)
 
-	var applyMessage raft.ApplyMsg
-	for {
-		applyMessage = <-kv.applyCh
-		if applyMessage != raft.LOSELEADERSHIPAPPLYMESSAGE && applyMessage.CommandIndex != index {
-			continue
-		}
-		break
-	}
+	ch := make(chan logCommitListenReply)
+	registerLogCommitListener(kv, index, ch)
 
-	if applyMessage.Command == command {
-		applyCommand(command, kv)
-		DPrintf("%d将%s的值更改为: %s, id: %d, index: %d.", kv.me, args.Key, dataStore[args.Key], args.ID, index)
-		filter[args.ID] = true
-	} else {
+	listenReply := <-ch
+	if listenReply.index == loseLeadershipIndex {
 		reply.Err = Err(fmt.Sprintf("Leader: %d has losed leadership.", kv.me))
 		DPrintf("%d不再是leader, 请求: %d需要重试.", kv.me, args.ID)
+	} else {
+		DPrintf("%d将%s的值更改为: %s, id: %d, index: %d.", kv.me, args.Key, listenReply.value, args.ID, index)
 	}
 }
 
@@ -152,8 +138,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
-	dataStore = nil
-	filter = nil
+	kv.isKilled.Store(true)
+	kv.applyCh <- poison
 }
 
 //
@@ -180,16 +166,87 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	kv.isKilled.Store(false)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	if dataStore == nil {
-		dataStore = make(map[string]string)
-	}
-	if filter == nil {
-		filter = make(map[int64]bool)
-	}
+	kv.logCommitListener = make(map[int]chan logCommitListenReply)
+	kv.duplicateRequestFilter = make(map[int64]bool)
+	kv.dataStore = make(map[string]string)
+	go listenRaftLogCommit(kv)
+
 	return kv
+}
+
+func registerLogCommitListener(kv *KVServer, index int, ch chan logCommitListenReply) {
+	kv.logCommitListenerLock.Lock()
+	if kv.logCommitListener[index] != nil {
+		panic("对index: " + strconv.Itoa(index) + "的监听器已存在!")
+	}
+	kv.logCommitListener[index] = ch
+	kv.logCommitListenerLock.Unlock()
+}
+
+func listenRaftLogCommit(kv *KVServer) {
+	for !kv.isKilled.Load().(bool) {
+		applyMessage := <-kv.applyCh
+		if applyMessage == poison {
+			break
+		}
+		if applyMessage.Command == raft.LOSELEADERSHIPAPPLYMESSAGE {
+			notifyLoseLeadership(kv)
+			continue
+		}
+
+		// TODO WTF?
+		op := applyMessage.Command.(*Op)
+		value := applyCommand(op, kv)
+		notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
+	}
+}
+
+func notifyLoseLeadership(kv *KVServer) {
+	kv.logCommitListenerLock.Lock()
+	defer kv.logCommitListenerLock.Unlock()
+
+	for _, ch := range kv.logCommitListener {
+		ch <- logCommitListenReply{index: loseLeadershipIndex}
+	}
+
+	kv.logCommitListener = make(map[int]chan logCommitListenReply)
+}
+
+func notifyLogCommit(index int, value string, requestID int64, kv *KVServer) {
+	kv.logCommitListenerLock.Lock()
+	defer kv.logCommitListenerLock.Unlock()
+
+	kv.duplicateRequestFilter[requestID] = true
+
+	ch := kv.logCommitListener[index]
+	if ch == nil {
+		return
+	}
+
+	ch <- logCommitListenReply{index: index, value: value}
+	kv.logCommitListener[index] = nil
+}
+
+func applyCommand(op *Op, kv *KVServer) string {
+	switch op.Operation {
+	case "Get":
+		break
+	case "Put":
+		kv.dataStore[op.Key] = op.Value
+		break
+	case "Append":
+		oldValue := kv.dataStore[op.Key]
+		if oldValue == "" {
+			kv.dataStore[op.Key] = op.Value
+		} else {
+			kv.dataStore[op.Key] = oldValue + op.Value
+		}
+	}
+
+	return kv.dataStore[op.Key]
 }
