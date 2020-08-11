@@ -1,16 +1,18 @@
 #!/bin/bash
 
-if [ $# -ne 2 ]; 
+if [ $# -ne 3 ]; 
 then
-    echo 'Usage: debug.sh <test_name> <count>.'
+    echo 'Usage: debug.sh <test_name> <timeout(s)> <count>.'
     exit 1
 fi
 
 i=0
-count=$2
+timeout=$2
+count=$3
+
 while (( $i < $count )) 
 do
-    `go test -count=1 -timeout=30s kvraft -run $1 > out`
+    `go test -count=1 -timeout=${timeout}s $(pwd) -run $1 -v > out`
     line=`tail -1 out`
     let i+=1
 

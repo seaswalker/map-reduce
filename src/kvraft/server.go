@@ -13,10 +13,10 @@ const Debug = 1
 
 // 全局(所有server共用)的请求过滤器，key为请求ID，如果ID在此map中存在，那么说明当前请求已被处理过，用以防止对同一个请求的重复处理
 // 比如server实际上已经处理完，但client没有收到响应(网络超时)，在这种情形下client会重复发送请求
-var filter = make(map[int64]bool)
+var filter map[int64]bool = make(map[int64]bool)
 
 // 全局的数据存储
-var dataStore = make(map[string]string)
+var dataStore map[string]string = make(map[string]string)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -152,6 +152,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	dataStore = nil
+	filter = nil
 }
 
 //
@@ -183,5 +185,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	if dataStore == nil {
+		dataStore = make(map[string]string)
+	}
+	if filter == nil {
+		filter = make(map[int64]bool)
+	}
 	return kv
 }

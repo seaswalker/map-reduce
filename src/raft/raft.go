@@ -123,7 +123,7 @@ type Raft struct {
 	electionTimeout int64
 	currentIndex    int
 	// 通知commit协程起来干活啦
-	commitCondition          *sync.Cond
+	applyCondition           *sync.Cond
 	applyCh                  chan ApplyMsg
 	needNotifyLoseLeaderShip bool
 }
@@ -340,7 +340,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.me, rf.commitIndex, args.LeaderCommit, actualCommitIndex, args.TraceID,
 			)
 			rf.commitIndex = actualCommitIndex
-			signalCommit(rf)
+			signalApply(rf)
 		}
 	}
 
@@ -524,7 +524,7 @@ func (rf *Raft) Kill() {
 
 	rf.state = KILLED
 
-	signalCommit(rf)
+	signalApply(rf)
 }
 
 //
@@ -614,7 +614,7 @@ func asABranNewFollower(raft *Raft) {
 }
 
 func startLogCommitter(raft *Raft) {
-	raft.commitCondition = sync.NewCond(new(sync.Mutex))
+	raft.applyCondition = sync.NewCond(new(sync.Mutex))
 	go commitLog(raft)
 }
 
@@ -699,10 +699,9 @@ func switchToFollower(raft *Raft, term int) {
 		raft.queuedEntryExpireCheckChan <- true
 
 		raft.needNotifyLoseLeaderShip = true
-		signalCommit(raft)
+		signalApply(raft)
 
 		go startLeadershipChecker(raft)
-
 		DPrintf("%d失去leadership, 对方term: %d.", raft.me, term)
 	}
 
@@ -1052,13 +1051,13 @@ func commitLogIfPossible(logIndex int, serverID int, raft *Raft) {
 	}
 
 	raft.commitIndex = logIndex
-	signalCommit(raft)
+	signalApply(raft)
 	DPrintf("Leader: %d提交到: %d.", raft.me, logIndex)
 }
 
 func commitLog(raft *Raft) {
 	for {
-		waitCommit(raft)
+		waitApply(raft)
 
 		if raft.state == KILLED {
 			break
@@ -1112,18 +1111,18 @@ func checkIfQueuedEntryExpired(raft *Raft) {
 	}
 }
 
-func waitCommit(raft *Raft) {
-	raft.commitCondition.L.Lock()
-	for raft.lastApplied >= raft.commitIndex {
-		raft.commitCondition.Wait()
+func waitApply(raft *Raft) {
+	raft.applyCondition.L.Lock()
+	for raft.lastApplied >= raft.commitIndex && !raft.needNotifyLoseLeaderShip {
+		raft.applyCondition.Wait()
 	}
-	raft.commitCondition.L.Unlock()
+	raft.applyCondition.L.Unlock()
 }
 
-func signalCommit(raft *Raft) {
-	raft.commitCondition.L.Lock()
-	raft.commitCondition.Broadcast()
-	raft.commitCondition.L.Unlock()
+func signalApply(raft *Raft) {
+	raft.applyCondition.L.Lock()
+	raft.applyCondition.Broadcast()
+	raft.applyCondition.L.Unlock()
 }
 
 func decreaseNextIndexAndRetry(raft *Raft, serverID int, nextIndex int, traceID string, logIndex int) {
