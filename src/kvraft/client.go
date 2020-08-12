@@ -1,4 +1,4 @@
-package raftkv
+package kvraft
 
 import (
 	"crypto/rand"

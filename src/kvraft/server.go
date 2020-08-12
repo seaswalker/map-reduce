@@ -1,4 +1,4 @@
-package raftkv
+package kvraft
 
 import (
 	"fmt"
@@ -7,6 +7,7 @@ import (
 	"log"
 	"raft"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -46,7 +47,7 @@ type KVServer struct {
 	logCommitListener      map[int]chan logCommitListenReply
 	logCommitListenerLock  sync.Mutex
 	isKilled               atomic.Value
-	duplicateRequestFilter map[int64]bool
+	duplicateRequestFilter map[int64]string
 }
 
 type logCommitListenReply struct {
@@ -73,6 +74,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	ch := make(chan logCommitListenReply)
 	registerLogCommitListener(kv, index, ch)
+
+	DPrintf("%d注册index: %d的监听器, 请求ID: %d, 开始等待raft事件.", kv.me, index, args.ID)
 
 	listenReply := <-ch
 
@@ -102,7 +105,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	requestHandled := kv.duplicateRequestFilter[args.ID]
 	kv.logCommitListenerLock.Unlock()
 
-	if requestHandled {
+	if requestHandled != "" {
+		DPrintf("%d拒绝重复请求%d.", kv.me, args.ID)
 		return
 	}
 
@@ -119,6 +123,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	ch := make(chan logCommitListenReply)
 	registerLogCommitListener(kv, index, ch)
+
+	DPrintf("%d注册index: %d的监听器, 请求ID: %d, 开始等待raft事件.", kv.me, index, args.ID)
 
 	listenReply := <-ch
 	if listenReply.index == loseLeadershipIndex {
@@ -159,7 +165,7 @@ func (kv *KVServer) Kill() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(&Op{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -172,7 +178,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.logCommitListener = make(map[int]chan logCommitListenReply)
-	kv.duplicateRequestFilter = make(map[int64]bool)
+	kv.duplicateRequestFilter = make(map[int64]string)
 	kv.dataStore = make(map[string]string)
 	go listenRaftLogCommit(kv)
 
@@ -191,17 +197,22 @@ func registerLogCommitListener(kv *KVServer, index int, ch chan logCommitListenR
 func listenRaftLogCommit(kv *KVServer) {
 	for !kv.isKilled.Load().(bool) {
 		applyMessage := <-kv.applyCh
+
 		if applyMessage == poison {
 			break
 		}
-		if applyMessage.Command == raft.LOSELEADERSHIPAPPLYMESSAGE {
+
+		if applyMessage == raft.LOSELEADERSHIPAPPLYMESSAGE {
 			notifyLoseLeadership(kv)
 			continue
 		}
 
-		// TODO WTF?
 		op := applyMessage.Command.(*Op)
-		value := applyCommand(op, kv)
+
+		value := requestApplied(op.RequestID, kv)
+		if value == "" {
+			value = applyCommand(op, kv)
+		}
 		notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
 	}
 }
@@ -210,18 +221,22 @@ func notifyLoseLeadership(kv *KVServer) {
 	kv.logCommitListenerLock.Lock()
 	defer kv.logCommitListenerLock.Unlock()
 
-	for _, ch := range kv.logCommitListener {
+	notifiedIndexes := make([]string, len(kv.logCommitListener))
+
+	for index, ch := range kv.logCommitListener {
 		ch <- logCommitListenReply{index: loseLeadershipIndex}
+		notifiedIndexes = append(notifiedIndexes, strconv.Itoa(index))
 	}
 
 	kv.logCommitListener = make(map[int]chan logCommitListenReply)
+	DPrintf("%d已向监听器: [%s]发送lose leadership通知.", kv.me, strings.Join(notifiedIndexes, ","))
 }
 
 func notifyLogCommit(index int, value string, requestID int64, kv *KVServer) {
 	kv.logCommitListenerLock.Lock()
 	defer kv.logCommitListenerLock.Unlock()
 
-	kv.duplicateRequestFilter[requestID] = true
+	kv.duplicateRequestFilter[requestID] = value
 
 	ch := kv.logCommitListener[index]
 	if ch == nil {
@@ -229,7 +244,13 @@ func notifyLogCommit(index int, value string, requestID int64, kv *KVServer) {
 	}
 
 	ch <- logCommitListenReply{index: index, value: value}
-	kv.logCommitListener[index] = nil
+	delete(kv.logCommitListener, index)
+}
+
+func requestApplied(requestID int64, kv *KVServer) string {
+	kv.logCommitListenerLock.Lock()
+	defer kv.logCommitListenerLock.Unlock()
+	return kv.duplicateRequestFilter[requestID]
 }
 
 func applyCommand(op *Op, kv *KVServer) string {

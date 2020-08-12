@@ -288,7 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("%d投票给%d, term: %d.", rf.me, args.CandidateId, args.Term)
 }
 
-// 处理AppendEntries请求(维持leader地位、log复制)
+// AppendEntries 用于维持leader地位、log复制
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args == nil || reply == nil {
 		return
