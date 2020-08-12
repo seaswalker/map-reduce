@@ -9,13 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
-const Debug = 1
+const Debug = 0
 const loseLeadershipIndex = -1
-
-var poison = raft.ApplyMsg{}
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -44,10 +41,10 @@ type KVServer struct {
 
 	dataStore map[string]string
 	// RPC handler监听某个index的日志提交
-	logCommitListener      map[int]chan logCommitListenReply
-	logCommitListenerLock  sync.Mutex
-	isKilled               atomic.Value
-	duplicateRequestFilter map[int64]string
+	logCommitListener         map[int]chan logCommitListenReply
+	logCommitListenerLock     sync.Mutex
+	stopLogCommitListenerChan chan bool
+	duplicateRequestFilter    map[int64]string
 }
 
 type logCommitListenReply struct {
@@ -144,8 +141,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
-	kv.isKilled.Store(true)
-	kv.applyCh <- poison
+	kv.stopLogCommitListenerChan <- true
 }
 
 //
@@ -172,8 +168,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-	kv.isKilled.Store(false)
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.stopLogCommitListenerChan = make(chan bool)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -195,25 +191,23 @@ func registerLogCommitListener(kv *KVServer, index int, ch chan logCommitListenR
 }
 
 func listenRaftLogCommit(kv *KVServer) {
-	for !kv.isKilled.Load().(bool) {
-		applyMessage := <-kv.applyCh
-
-		if applyMessage == poison {
+	for {
+		select {
+		case applyMessage := <-kv.applyCh:
+			if applyMessage == raft.LOSELEADERSHIPAPPLYMESSAGE {
+				notifyLoseLeadership(kv)
+			} else {
+				op := applyMessage.Command.(*Op)
+				// Raft提交的消息实际上对于请求来说仍然可能存在重复，所以这里需要过滤
+				value := requestApplied(op.RequestID, kv)
+				if value == "" {
+					value = applyCommand(op, kv)
+				}
+				notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
+			}
+		case _ = <-kv.stopLogCommitListenerChan:
 			break
 		}
-
-		if applyMessage == raft.LOSELEADERSHIPAPPLYMESSAGE {
-			notifyLoseLeadership(kv)
-			continue
-		}
-
-		op := applyMessage.Command.(*Op)
-
-		value := requestApplied(op.RequestID, kv)
-		if value == "" {
-			value = applyCommand(op, kv)
-		}
-		notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
 	}
 }
 
