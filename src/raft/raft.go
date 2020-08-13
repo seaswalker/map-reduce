@@ -561,7 +561,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		)
 		recoverFromPersistedState(raft)
 	} else {
-		asABranNewFollower(raft)
+		asABrandNewFollower(raft)
 	}
 
 	startLogCommitter(raft)
@@ -607,7 +607,7 @@ func recoverAsFollower(raft *Raft) {
 	go startLeadershipChecker(raft)
 }
 
-func asABranNewFollower(raft *Raft) {
+func asABrandNewFollower(raft *Raft) {
 	raft.log = make([]*LogEntry, logEntryArraySize)
 	raft.currentTerm = 0
 	recoverAsFollower(raft)
