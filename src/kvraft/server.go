@@ -45,12 +45,19 @@ type KVServer struct {
 	logCommitListenerLock     sync.Mutex
 	stopLogCommitListenerChan chan bool
 	duplicateRequestFilter    map[int64]string
+	persister                 *raft.Persister
 }
 
 type logCommitListenReply struct {
 	index int
 	// 只有get请求才不为空
 	value string
+}
+
+// snapshot KVServer需要保存到快照中的属性
+type snapshot struct {
+	DataStore              map[string]string
+	DuplicateRequestFilter map[int64]string
 }
 
 // Get 强一致性读
@@ -162,6 +169,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(&Op{})
+	labgob.Register(&snapshot{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -171,6 +179,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.stopLogCommitListenerChan = make(chan bool)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.logCommitListener = make(map[int]chan logCommitListenReply)
@@ -204,6 +213,7 @@ func listenRaftLogCommit(kv *KVServer) {
 					value = applyCommand(op, kv)
 				}
 				notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
+				createSnapshotIfNecessary(kv, applyMessage.CommandIndex)
 			}
 		case _ = <-kv.stopLogCommitListenerChan:
 			break
@@ -264,4 +274,15 @@ func applyCommand(op *Op, kv *KVServer) string {
 	}
 
 	return kv.dataStore[op.Key]
+}
+
+func createSnapshotIfNecessary(kv *KVServer, index int) {
+	if kv.maxraftstate <= 0 || kv.maxraftstate > kv.persister.RaftStateSize() {
+		return
+	}
+
+	snap := &snapshot{DataStore: kv.dataStore, DuplicateRequestFilter: kv.duplicateRequestFilter}
+
+	data := labgob.EncodeToByteArray(snap)
+	kv.rf.CreateSnapshot(data, index)
 }

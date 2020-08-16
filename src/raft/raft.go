@@ -121,11 +121,14 @@ type Raft struct {
 
 	// 当前Server选取过期时间(毫秒)
 	electionTimeout int64
-	currentIndex    int
+	// 单调递增(即使snapshot存在)，在64位平台是int时64位，假设保持每秒5000次请求，足够使用5800万年
+	currentIndex int
 	// 通知commit协程起来干活啦
 	applyCondition           *sync.Cond
 	applyCh                  chan ApplyMsg
 	needNotifyLoseLeaderShip bool
+	// commitIndex减去此值才是真正在log数组的元素下标
+	snapShotOffset int
 }
 
 type LogEntry struct {
@@ -134,12 +137,33 @@ type LogEntry struct {
 	Command interface{}
 }
 
-// return currentTerm and whether this server
+type stateSnapshot struct {
+	LastIncludeIndex int
+	LastIncludeTerm  int
+}
+
+// GetState return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	// Your code here (2A).
 	return rf.currentTerm, rf.state == LEADER
+}
+
+// CreateSnapshot 由KVServer调用，生成快照直到index(包含)
+func (rf *Raft) CreateSnapshot(kvServerDataStore []byte, index int) {
+	stateSnap := &stateSnapshot{LastIncludeIndex: index, LastIncludeTerm: rf.log[toRealLogIndex(rf, index)].Term}
+
+	stateData := labgob.EncodeToByteArray(stateSnap)
+
+	rf.persister.SaveStateAndSnapshot(stateData, kvServerDataStore)
+
+	rf.mu.Lock()
+	rf.log = rf.log[toRealLogIndex(rf, index+1):]
+	rf.snapShotOffset = index + 1
+	rf.mu.Unlock()
+}
+
+func toRealLogIndex(raft *Raft, index int) int {
+	return index - raft.snapShotOffset
 }
 
 //
@@ -563,6 +587,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	} else {
 		asABrandNewFollower(raft)
 	}
+
+	labgob.Register(&stateSnapshot{})
 
 	startLogCommitter(raft)
 	startServer(peers[me])

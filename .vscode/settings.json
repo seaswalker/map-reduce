@@ -1,6 +1,6 @@
 {
-    "http.proxy": "http://127.0.0.1:7890",
-    "http.proxySupport": "on",
+    "http.proxy": "http://127.0.0.1:58591",
+    "http.proxySupport": "off",
     "go.installDependenciesWhenBuilding": false,
-    "go.inferGopath": false
+    "go.inferGopath": true
 }
