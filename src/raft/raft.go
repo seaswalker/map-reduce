@@ -127,8 +127,7 @@ type Raft struct {
 	applyCondition           *sync.Cond
 	applyCh                  chan ApplyMsg
 	needNotifyLoseLeaderShip bool
-	// commitIndex减去此值才是真正在log数组的元素下标
-	snapShotOffset int
+	snapshot                 *stateSnapshot
 }
 
 type LogEntry struct {
@@ -150,20 +149,34 @@ func (rf *Raft) GetState() (int, bool) {
 
 // CreateSnapshot 由KVServer调用，生成快照直到index(包含)
 func (rf *Raft) CreateSnapshot(kvServerDataStore []byte, index int) {
-	stateSnap := &stateSnapshot{LastIncludeIndex: index, LastIncludeTerm: rf.log[toRealLogIndex(rf, index)].Term}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	stateData := labgob.EncodeToByteArray(stateSnap)
+	rf.snapshot.LastIncludeTerm = rf.log[getRealLogIndex(rf, index)].Term
+	rf.log = rf.log[getRealLogIndex(rf, index+1):]
+	rf.snapshot.LastIncludeIndex = index
+	stateData := encodeCurrentState(rf)
 
 	rf.persister.SaveStateAndSnapshot(stateData, kvServerDataStore)
-
-	rf.mu.Lock()
-	rf.log = rf.log[toRealLogIndex(rf, index+1):]
-	rf.snapShotOffset = index + 1
-	rf.mu.Unlock()
 }
 
-func toRealLogIndex(raft *Raft, index int) int {
-	return index - raft.snapShotOffset
+// 当作为follower收到leader的InstallSnapshot请求时调用
+func (rf *Raft) createSnapshotFromLeader(kvServerDataStore []byte, index int, lastIncludeTerm int) {
+	rf.snapshot.LastIncludeTerm = lastIncludeTerm
+	rf.snapshot.LastIncludeIndex = index
+	if rf.currentIndex <= index {
+		rf.currentIndex = index + 1
+		rf.log = make([]*LogEntry, logEntryArraySize)
+	} else {
+		rf.log = rf.log[getRealLogIndex(rf, index+1):]
+	}
+	stateData := encodeCurrentState(rf)
+
+	rf.persister.SaveStateAndSnapshot(stateData, kvServerDataStore)
+}
+
+func getRealLogIndex(raft *Raft, index int) int {
+	return index - raft.snapshot.LastIncludeIndex - 1
 }
 
 //
@@ -172,8 +185,11 @@ func toRealLogIndex(raft *Raft, index int) int {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
+	data := encodeCurrentState(rf)
+	rf.persister.SaveRaftState(data)
+}
 
+func encodeCurrentState(rf *Raft) []byte {
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	err := encoder.Encode(rf.currentTerm)
@@ -186,14 +202,18 @@ func (rf *Raft) persist() {
 		panic(err)
 	}
 
-	logArray := rf.log[0:rf.currentIndex]
+	logArray := rf.log[0:getRealLogIndex(rf, rf.currentIndex)]
 	err = encoder.Encode(logArray)
 	if err != nil {
 		panic(err)
 	}
 
-	data := writer.Bytes()
-	rf.persister.SaveRaftState(data)
+	err = encoder.Encode(rf.snapshot)
+	if err != nil {
+		panic(err)
+	}
+
+	return writer.Bytes()
 }
 
 //
@@ -203,7 +223,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
 
 	reader := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(reader)
@@ -226,9 +245,16 @@ func (rf *Raft) readPersist(data []byte) {
 		panic(err)
 	}
 
+	var snapshot *stateSnapshot
+	err = decoder.Decode(snapshot)
+	if err != nil {
+		panic(err)
+	}
+
+	rf.snapshot = snapshot
 	rf.currentTerm = currentTerm
 	rf.state = state
-	rf.currentIndex = len(logEntries)
+	rf.currentIndex = len(logEntries) + rf.snapshot.LastIncludeIndex + 1
 	// 还是保持数组原有的长度
 	array := make([]*LogEntry, logEntryArraySize)
 	copy(array, logEntries)
@@ -250,7 +276,7 @@ type RequestVoteArgs struct {
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderID     int
-	PreLogIndex  int
+	PrevLogIndex int
 	PrevLogTerm  int
 	Entries      []*LogEntry
 	LeaderCommit int
@@ -273,6 +299,21 @@ type AppendEntriesReply struct {
 	Success bool
 	// 告诉leader下次请求时发送的log数组的最低index是NextIndex
 	NextIndex int
+}
+
+// InstallSnapshot leader将自己的snapshot发送给follower
+type InstallSnapshot struct {
+	Term             int
+	leaderID         int
+	LastIncludeIndex int
+	LastIncludeTerm  int
+	Data             []byte
+}
+
+// InstallSnapshotReply RPC的响应
+type InstallSnapshotReply struct {
+	// follower的term
+	Term int
 }
 
 //
@@ -375,18 +416,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	)
 }
 
+// InstallSnapshot 处理InstallSnapshot RPC请求
+func (rf *Raft) InstallSnapshot(args *InstallSnapshot, reply *InstallSnapshotReply) {
+	if args == nil || reply == nil {
+		return
+	}
+
+	if rf.currentTerm > args.Term {
+		DPrintf("%d拒绝%d的InstallSnapshot请求, 当前term: %d > 请求term: %d.", rf.me, args.leaderID, rf.currentTerm, args.Term)
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if rf.snapshot.LastIncludeIndex >= args.LastIncludeIndex {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	acceptLeadership(rf, args.Term)
+
+	rf.createSnapshotFromLeader(args.Data, args.LastIncludeIndex, args.LastIncludeTerm)
+
+	// 将leader发过来的数据覆盖到此follower对应的KVServer
+}
+
 func canVoteFor(raft *Raft, args *RequestVoteArgs) (canVote bool, reason string) {
 	if raft.currentIndex == 0 {
-		return true, ""
-	}
-
-	lastLogEntry := raft.log[raft.currentIndex-1]
-	if lastLogEntry.Term > args.LastLogTerm {
-		return false, fmt.Sprintf(
-			"lastLogEntry.Term: %d > args.LastLogTerm: %d", lastLogEntry.Term, args.LastLogTerm)
-	}
-
-	if lastLogEntry.Term < args.LastLogTerm {
 		return true, ""
 	}
 
@@ -395,24 +452,40 @@ func canVoteFor(raft *Raft, args *RequestVoteArgs) (canVote bool, reason string)
 			"lastLogIndex: %d > args.lastLogIndex: %d", raft.currentIndex-1, args.LastLogIndex)
 	}
 
+	realLastLogEntryIndex := getRealLogIndex(raft, raft.currentIndex-1)
+	var lastLogEntryTerm int
+	if realLastLogEntryIndex < 0 {
+		lastLogEntryTerm = raft.snapshot.LastIncludeTerm
+	} else {
+		lastLogEntryTerm = raft.log[realLastLogEntryIndex].Term
+	}
+
+	if lastLogEntryTerm > args.LastLogTerm {
+		return false, fmt.Sprintf(
+			"lastLogEntry.Term: %d > args.LastLogTerm: %d", lastLogEntryTerm, args.LastLogTerm)
+	}
+
 	return true, ""
 }
 
 func checkPrevLog(raft *Raft, args *AppendEntriesArgs) (success bool, nextIndex int, reason string) {
-	if args.PreLogIndex == -1 {
+	if getRealLogIndex(raft, args.PrevLogIndex) == -1 {
 		return true, -1, ""
 	}
 
-	if args.PreLogIndex >= raft.currentIndex {
+	if args.PrevLogIndex >= raft.currentIndex {
 		// leader比当前follower日志更多，告诉leader当前follower最新日志的index，下次leader在此index开始
-		return false, raft.currentIndex, fmt.Sprintf("PrelogIndex: %d >= currentIndex: %d", args.PreLogIndex, raft.currentIndex)
+		return false, raft.currentIndex, fmt.Sprintf("PrelogIndex: %d >= currentIndex: %d", args.PrevLogIndex, raft.currentIndex)
 	}
 
-	entry := raft.log[args.PreLogIndex]
+	// 到这里args.PrevLogIndex必定大于raft.snap.lastIncludeIndex，原因:
+	// 如果相等，那么说明必定比较的是已经commit的log，所以肯定是相等的(只有commit了的log才能被创建snapshot)
+	// 根据上面的逻辑，args.PrevLogIndex等于lastIncludeIndex时就像leader返回了true, leader自然也不会再减小nextIndex并重试
+	entry := raft.log[getRealLogIndex(raft, args.PrevLogIndex)]
 	if entry.Term != args.PrevLogTerm {
 		// 找到非当前term的最新index
-		index := args.PreLogIndex - 1
-		for ; index >= 0 && raft.log[index].Term == entry.Term; index-- {
+		index := args.PrevLogIndex - 1
+		for ; index > raft.snapshot.LastIncludeIndex && raft.log[getRealLogIndex(raft, index)].Term == entry.Term; index-- {
 		}
 		return false, index + 1, fmt.Sprintf("PreLogTerm: %d != leaderPrevLogTerm: %d", entry.Term, args.PrevLogTerm)
 	}
@@ -421,7 +494,7 @@ func checkPrevLog(raft *Raft, args *AppendEntriesArgs) (success bool, nextIndex 
 }
 
 func replicateToLocal(raft *Raft, args *AppendEntriesArgs) {
-	writeIndex := args.PreLogIndex
+	writeIndex := args.PrevLogIndex
 	for i := 0; i < len(args.Entries); i++ {
 		writeIndex++
 		raft.log[writeIndex] = args.Entries[i]
@@ -478,6 +551,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshot, reply *InstallSnapshotReply) bool {
+	return rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 }
 
 //
@@ -588,8 +665,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		asABrandNewFollower(raft)
 	}
 
-	labgob.Register(&stateSnapshot{})
-
+	registerEncoder(raft)
 	startLogCommitter(raft)
 	startServer(peers[me])
 
@@ -600,9 +676,19 @@ func setCommonStates(raft *Raft) {
 	raft.currentIndex = 0
 	raft.commitIndex = -1
 	raft.lastApplied = -1
+	raft.snapshot = &stateSnapshot{LastIncludeIndex: -1, LastIncludeTerm: -1}
+}
+
+func registerEncoder(raft *Raft) {
+	labgob.Register(&stateSnapshot{})
+	labgob.Register(&InstallSnapshot{})
+	labgob.Register(&InstallSnapshotReply{})
 }
 
 func recoverFromPersistedState(raft *Raft) {
+	raft.commitIndex = raft.snapshot.LastIncludeIndex
+	raft.lastApplied = raft.commitIndex
+
 	switch raft.state {
 	case FOLLOWER:
 		recoverAsFollower(raft)
@@ -896,7 +982,7 @@ func doHeartbeat(raft *Raft) {
 			args := AppendEntriesArgs{
 				Term:         raft.currentTerm,
 				LeaderID:     raft.me,
-				PreLogIndex:  prevLogIndex,
+				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
 				Entries:      nil,
 				LeaderCommit: raft.commitIndex,
@@ -944,7 +1030,7 @@ func saveLogEntry(command interface{}, raft *Raft) int {
 		Command: command,
 	}
 
-	raft.log[logIndex] = &entry
+	raft.log[getRealLogIndex(raft, logIndex)] = &entry
 	return logIndex
 }
 
@@ -967,23 +1053,33 @@ func startAgreement(raft *Raft, logIndex int) int {
 //    的log entry的过程
 // 如果不按照上述逻辑，是无法通过TestRejoin2B单元测试的
 func replicateToFollower(serverID int, lowBound int, logIndex int, raft *Raft, traceID string) {
+	if lowBound < raft.snapshot.LastIncludeIndex {
+		if !sendInstallSnapshotRPC(raft, serverID, traceID) {
+			return
+		}
+		lowBound = raft.snapshot.LastIncludeIndex
+	}
+
 	var entries []*LogEntry
 	if logIndex >= lowBound {
 		// slice: [)
-		entries = raft.log[lowBound+1 : logIndex+1]
+		entries = raft.log[getRealLogIndex(raft, lowBound+1):getRealLogIndex(raft, logIndex+1)]
 	}
 
 	args := AppendEntriesArgs{
 		Term:         raft.currentTerm,
 		LeaderID:     raft.me,
-		PreLogIndex:  lowBound,
+		PrevLogIndex: lowBound,
 		PrevLogTerm:  -1,
 		Entries:      entries,
 		LeaderCommit: raft.commitIndex,
 		TraceID:      traceID,
 	}
-	if lowBound >= 0 {
-		args.PrevLogTerm = raft.log[lowBound].Term
+
+	if lowBound > raft.snapshot.LastIncludeIndex {
+		args.PrevLogTerm = raft.log[getRealLogIndex(raft, lowBound)].Term
+	} else if lowBound == raft.snapshot.LastIncludeIndex {
+		args.PrevLogTerm = raft.snapshot.LastIncludeTerm
 	}
 	reply := AppendEntriesReply{}
 
@@ -1009,7 +1105,7 @@ func replicateToFollower(serverID int, lowBound int, logIndex int, raft *Raft, t
 			}
 			DPrintf(
 				"%d向%d发送log replicate请求成功, 响应: %v, term: %d, prevLogIndex: %d, prevLogTerm: %d, firstLogEntry: %#v, lastLogEntry: %#v, traceId: %v.",
-				raft.me, serverID, reply.Success, args.Term, args.PreLogIndex, args.PrevLogTerm, firstLogEntry, lastLogEntry, args.TraceID,
+				raft.me, serverID, reply.Success, args.Term, args.PrevLogIndex, args.PrevLogTerm, firstLogEntry, lastLogEntry, args.TraceID,
 			)
 		}
 
@@ -1040,6 +1136,38 @@ func replicateToFollower(serverID int, lowBound int, logIndex int, raft *Raft, t
 		decreaseNextIndexAndRetry(raft, serverID, reply.NextIndex, traceID, logIndex)
 		break
 	}
+}
+
+// 如果请求成功，返回true，否则表示对方的term更高，当前leader已转为follower
+func sendInstallSnapshotRPC(raft *Raft, serverID int, traceID string) bool {
+	request := &InstallSnapshot{
+		Term:             raft.currentTerm,
+		leaderID:         raft.me,
+		LastIncludeIndex: raft.snapshot.LastIncludeIndex,
+		LastIncludeTerm:  raft.snapshot.LastIncludeTerm,
+		Data:             raft.persister.ReadSnapshot(),
+	}
+
+	result := true
+	reply := &InstallSnapshotReply{}
+	for {
+		sendResult := raft.sendInstallSnapshot(serverID, request, reply)
+		if !sendResult {
+			continue
+		}
+
+		if reply.Term > request.Term {
+			DPrintf("%d的term: %d小于follower%d的term: %d，转为follower, traceId: %v.", raft.me, raft.currentTerm, serverID, reply.Term, traceID)
+			raft.mu.Lock()
+			acceptLeadership(raft, reply.Term)
+			raft.mu.Unlock()
+			result = false
+		}
+
+		break
+	}
+
+	return result
 }
 
 func commitLogIfPossible(logIndex int, serverID int, raft *Raft) {
