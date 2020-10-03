@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"labgob"
 	"labrpc"
@@ -205,20 +206,38 @@ func listenRaftLogCommit(kv *KVServer) {
 		case applyMessage := <-kv.applyCh:
 			if applyMessage == raft.LOSELEADERSHIPAPPLYMESSAGE {
 				notifyLoseLeadership(kv)
-			} else {
-				op := applyMessage.Command.(*Op)
-				// Raft提交的消息实际上对于请求来说仍然可能存在重复，所以这里需要过滤
-				value := requestApplied(op.RequestID, kv)
-				if value == "" {
-					value = applyCommand(op, kv)
-				}
-				notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
-				createSnapshotIfNecessary(kv, applyMessage.CommandIndex)
+				continue
+			}
+
+			command := applyMessage.Command
+			_, ok := command.(*Op)
+			if ok {
+				handleApplyMessage(kv, applyMessage)
+				continue
+			}
+
+			data, ok := command.([]byte)
+			if ok {
+				overwriteLocalDatastore(data, kv)
+				continue
 			}
 		case _ = <-kv.stopLogCommitListenerChan:
 			break
 		}
 	}
+}
+
+func handleApplyMessage(kv *KVServer, applyMessage raft.ApplyMsg) {
+	op := applyMessage.Command.(*Op)
+	// Raft提交的消息实际上对于请求来说仍然可能存在重复，所以这里需要过滤
+	value := requestApplied(op.RequestID, kv)
+	if value == "" {
+		value = applyCommand(op, kv)
+	} else {
+		DPrintf("发现重复请求!")
+	}
+	notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
+	createSnapshotIfNecessary(kv, applyMessage.CommandIndex)
 }
 
 func notifyLoseLeadership(kv *KVServer) {
@@ -285,4 +304,21 @@ func createSnapshotIfNecessary(kv *KVServer, index int) {
 
 	data := labgob.EncodeToByteArray(snap)
 	kv.rf.CreateSnapshot(data, index)
+}
+
+// 用leader发送过来的snapshot覆盖本地的数据
+func overwriteLocalDatastore(snapshotData []byte, kv *KVServer) {
+	reader := bytes.NewBuffer(snapshotData)
+	decoder := labgob.NewDecoder(reader)
+
+	var snap *snapshot = &snapshot{}
+	err := decoder.Decode(snap)
+
+	if err != nil {
+		panic(err)
+	}
+
+	kv.dataStore = snap.DataStore
+	kv.duplicateRequestFilter = snap.DuplicateRequestFilter
+	DPrintf("用leader的snapshot覆盖本地完成.")
 }
