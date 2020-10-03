@@ -523,14 +523,7 @@ func replicateToLocal(raft *Raft, args *AppendEntriesArgs) {
 	diff := 0
 	for i := writeIndex + 1; i < raft.currentIndex; i++ {
 		// 删除冲突的entry(term不一致)
-		realIndex := getRealLogIndex(raft, i)
-
-		// TODO debug
-		if raft.log[realIndex] == nil {
-			panic("error")
-		}
-
-		if raft.log[realIndex].Term != args.Term {
+		if raft.log[getRealLogIndex(raft, i)].Term != args.Term {
 			raft.log[realIndex] = nil
 			diff++
 		}
