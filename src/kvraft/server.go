@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"labgob"
 	"labrpc"
@@ -10,10 +11,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/go-redis/redis"
 )
 
-const Debug = 0
+const Debug = 1
 const loseLeadershipIndex = -1
+
+var redisInitFlag int32
+
+var redisClient *redis.Client
+var ctx = context.Background()
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -45,7 +55,6 @@ type KVServer struct {
 	logCommitListener         map[int]chan logCommitListenReply
 	logCommitListenerLock     sync.Mutex
 	stopLogCommitListenerChan chan bool
-	duplicateRequestFilter    map[int64]string
 	persister                 *raft.Persister
 }
 
@@ -57,8 +66,7 @@ type logCommitListenReply struct {
 
 // snapshot KVServer需要保存到快照中的属性
 type snapshot struct {
-	DataStore              map[string]string
-	DuplicateRequestFilter map[int64]string
+	DataStore map[string]string
 }
 
 // Get 强一致性读
@@ -106,11 +114,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	kv.logCommitListenerLock.Lock()
-	requestHandled := kv.duplicateRequestFilter[args.ID]
-	kv.logCommitListenerLock.Unlock()
+	value, _ := redisClient.Get(ctx, generateRedisKey(args.ID, kv)).Result()
 
-	if requestHandled != "" {
+	if value != "" {
 		DPrintf("%d拒绝重复请求%d.", kv.me, args.ID)
 		return
 	}
@@ -184,11 +190,27 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.logCommitListener = make(map[int]chan logCommitListenReply)
-	kv.duplicateRequestFilter = make(map[int64]string)
 	kv.dataStore = make(map[string]string)
 	go listenRaftLogCommit(kv)
 
+	initRedis()
+
 	return kv
+}
+
+func initRedis() {
+	swapped := atomic.CompareAndSwapInt32(&redisInitFlag, 0, 1)
+	if !swapped {
+		return
+	}
+
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+
+	DPrintf("Redis连接成功.")
 }
 
 func registerLogCommitListener(kv *KVServer, index int, ch chan logCommitListenReply) {
@@ -229,15 +251,25 @@ func listenRaftLogCommit(kv *KVServer) {
 
 func handleApplyMessage(kv *KVServer, applyMessage raft.ApplyMsg) {
 	op := applyMessage.Command.(*Op)
-	// Raft提交的消息实际上对于请求来说仍然可能存在重复，所以这里需要过滤
-	value := requestApplied(op.RequestID, kv)
-	if value == "" {
+
+	// update操作不关心返回值，value是空串
+	value := ""
+	if !isDuplicateRequest(op, kv) {
 		value = applyCommand(op, kv)
-	} else {
-		DPrintf("发现重复请求!")
 	}
-	notifyLogCommit(applyMessage.CommandIndex, value, op.RequestID, kv)
+
+	notifyLogCommit(applyMessage.CommandIndex, value, op, kv)
 	createSnapshotIfNecessary(kv, applyMessage.CommandIndex)
+}
+
+func isDuplicateRequest(op *Op, kv *KVServer) bool {
+	if op.Operation == "Get" {
+		return false
+	}
+
+	value, _ := redisClient.Get(ctx, generateRedisKey(op.RequestID, kv)).Result()
+
+	return value != ""
 }
 
 func notifyLoseLeadership(kv *KVServer) {
@@ -255,11 +287,17 @@ func notifyLoseLeadership(kv *KVServer) {
 	DPrintf("%d已向监听器: [%s]发送lose leadership通知.", kv.me, strings.Join(notifiedIndexes, ","))
 }
 
-func notifyLogCommit(index int, value string, requestID int64, kv *KVServer) {
+func notifyLogCommit(index int, value string, op *Op, kv *KVServer) {
 	kv.logCommitListenerLock.Lock()
 	defer kv.logCommitListenerLock.Unlock()
 
-	kv.duplicateRequestFilter[requestID] = value
+	// Get请求没有必要过滤
+	if op.Operation != "Get" {
+		_, err := redisClient.SetNX(ctx, generateRedisKey(op.RequestID, kv), true, time.Hour).Result()
+		if err != nil {
+			panic(err)
+		}
+	}
 
 	ch := kv.logCommitListener[index]
 	if ch == nil {
@@ -268,12 +306,6 @@ func notifyLogCommit(index int, value string, requestID int64, kv *KVServer) {
 
 	ch <- logCommitListenReply{index: index, value: value}
 	delete(kv.logCommitListener, index)
-}
-
-func requestApplied(requestID int64, kv *KVServer) string {
-	kv.logCommitListenerLock.Lock()
-	defer kv.logCommitListenerLock.Unlock()
-	return kv.duplicateRequestFilter[requestID]
 }
 
 func applyCommand(op *Op, kv *KVServer) string {
@@ -300,7 +332,7 @@ func createSnapshotIfNecessary(kv *KVServer, index int) {
 		return
 	}
 
-	snap := &snapshot{DataStore: kv.dataStore, DuplicateRequestFilter: kv.duplicateRequestFilter}
+	snap := &snapshot{DataStore: kv.dataStore}
 
 	data := labgob.EncodeToByteArray(snap)
 	kv.rf.CreateSnapshot(data, index)
@@ -311,7 +343,7 @@ func overwriteLocalDatastore(snapshotData []byte, kv *KVServer) {
 	reader := bytes.NewBuffer(snapshotData)
 	decoder := labgob.NewDecoder(reader)
 
-	var snap *snapshot = &snapshot{}
+	var snap = &snapshot{}
 	err := decoder.Decode(snap)
 
 	if err != nil {
@@ -319,6 +351,9 @@ func overwriteLocalDatastore(snapshotData []byte, kv *KVServer) {
 	}
 
 	kv.dataStore = snap.DataStore
-	kv.duplicateRequestFilter = snap.DuplicateRequestFilter
-	DPrintf("用leader的snapshot覆盖本地完成.")
+	DPrintf("用leader的snapshot覆盖本地: %d, dataStore: %#v.", kv.me, kv.dataStore)
+}
+
+func generateRedisKey(requestId int64, kv *KVServer) string {
+	return strconv.Itoa(kv.me) + "-" + strconv.FormatInt(requestId, 10)
 }

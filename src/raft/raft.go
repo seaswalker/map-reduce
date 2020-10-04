@@ -523,7 +523,8 @@ func replicateToLocal(raft *Raft, args *AppendEntriesArgs) {
 	diff := 0
 	for i := writeIndex + 1; i < raft.currentIndex; i++ {
 		// 删除冲突的entry(term不一致)
-		if raft.log[getRealLogIndex(raft, i)].Term != args.Term {
+		realIndex := getRealLogIndex(raft, i)
+		if raft.log[realIndex].Term != args.Term {
 			raft.log[realIndex] = nil
 			diff++
 		}
@@ -859,11 +860,11 @@ func acceptLeadership(raft *Raft, term int) {
 }
 
 func requestVotes(raft *Raft) {
-	voteArgs := RequestVoteArgs{Term: raft.currentTerm, CandidateId: raft.me, LastLogIndex: -1, LastLogTerm: -1}
-	if raft.currentIndex > 0 {
-		lastLogEntry := raft.log[getRealLogIndex(raft, raft.currentIndex-1)]
-		voteArgs.LastLogIndex = lastLogEntry.Index
-		voteArgs.LastLogTerm = lastLogEntry.Term
+	voteArgs := RequestVoteArgs{
+		Term:         raft.currentTerm,
+		CandidateId:  raft.me,
+		LastLogIndex: raft.currentIndex - 1,
+		LastLogTerm:  determinePrevLogTerm(raft),
 	}
 
 	for index := range raft.peers {
@@ -991,12 +992,11 @@ func doHeartbeat(raft *Raft) {
 
 		go func() {
 			raft.mu.Lock()
+
 			prevLogIndex := raft.currentIndex - 1
 			traceID := randstring(10)
-			prevLogTerm := -1
-			if prevLogIndex >= 0 {
-				prevLogTerm = raft.log[getRealLogIndex(raft, prevLogIndex)].Term
-			}
+			prevLogTerm := determinePrevLogTerm(raft)
+
 			raft.mu.Unlock()
 
 			args := AppendEntriesArgs{
@@ -1313,4 +1313,14 @@ func decreaseNextIndexAndRetry(raft *Raft, serverID int, nextIndex int, traceID 
 
 	// nextIndex是向follower发送log数组的界限，最小为零，而replicateToFollower的参数lowBound是prevLogIndex，所以可以为-1
 	replicateToFollower(serverID, nextIndex-1, logIndex, raft, traceID)
+}
+
+func determinePrevLogTerm(raft *Raft) int {
+	prevLogIndex := raft.currentIndex - 1
+	if prevLogIndex <= raft.snapshot.LastIncludedIndex {
+		return raft.snapshot.LastIncludedTerm
+	}
+
+	realIndex := getRealLogIndex(raft, prevLogIndex)
+	return raft.log[realIndex].Term
 }

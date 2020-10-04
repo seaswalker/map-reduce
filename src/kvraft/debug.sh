@@ -17,16 +17,16 @@ do
     let i+=1
 
     if [[ $line == ok* ]]; then
-        echo "第$i次成功了...." 
+        echo "第${i}次成功了...."
         rm -f out
         continue
     fi
     
     mv out error.log
-    echo "第$i次失败了，日志位于：error.log."
+    echo "第${i}次失败了，日志位于：error.log."
     break
 done
 
 if [[ $i -eq $count ]]; then
-    echo "执行了$count次，全都成功了..."
+    echo "执行了${count}次，全都成功了..."
 fi
