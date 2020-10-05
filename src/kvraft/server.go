@@ -188,13 +188,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
     kv.persister = persister
     kv.logCommitListener = make(map[int]chan logCommitListenReply)
     kv.dataStore = make(map[string]string)
-    // 在raft初始化之前就启动对和raft通信channel的监听，这样才能完成重启时datastore重建
     go listenRaftLogCommit(kv)
 
     // You may need initialization code here.
-    initRedis()
-
     kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+    initRedis()
 
     return kv
 }
@@ -253,26 +252,28 @@ func listenRaftLogCommit(kv *KVServer) {
 func handleApplyMessage(kv *KVServer, applyMessage raft.ApplyMsg) {
     op := applyMessage.Command.(*Op)
 
-    if applyMessage.Replay {
-        DPrintf("收到replay请求, index: %d, op: %v.", applyMessage.CommandIndex, op)
-    }
-
     // update操作不关心返回值，value是空串
     value := ""
-    if applyMessage.Replay || !isDuplicateRequest(op, kv) {
+    if !isDuplicateRequest(applyMessage.Replay, op, kv) {
         value = applyCommand(op, kv)
     }
 
     notifyLogCommit(applyMessage, value, op, kv)
-    createSnapshotIfNecessary(kv, applyMessage.CommandIndex)
+    if !applyMessage.Replay {
+        createSnapshotIfNecessary(kv, applyMessage.CommandIndex)
+    }
 }
 
-func isDuplicateRequest(op *Op, kv *KVServer) bool {
+func isDuplicateRequest(replay bool, op *Op, kv *KVServer) bool {
     if op.Operation == "Get" {
         return false
     }
 
-    value, _ := redisClient.Get(ctx, generateRedisKey(op.RequestID, kv)).Result()
+    redisKey := generateRedisKey(op.RequestID, kv)
+    if replay {
+        redisKey = "replay-" + redisKey
+    }
+    value, _ := redisClient.Get(ctx, redisKey).Result()
 
     return value != ""
 }
@@ -297,7 +298,7 @@ func notifyLogCommit(applyMessage raft.ApplyMsg, value string, op *Op, kv *KVSer
     defer kv.logCommitListenerLock.Unlock()
 
     // Get请求没有必要过滤
-    if !applyMessage.Replay && op.Operation != "Get" {
+    if op.Operation != "Get" {
         _, err := redisClient.SetNX(ctx, generateRedisKey(op.RequestID, kv), true, time.Hour).Result()
         if err != nil {
             panic(err)

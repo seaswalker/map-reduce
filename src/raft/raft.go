@@ -465,7 +465,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshot, reply *InstallSnapshotRep
 func replayDatastore(snapshot []byte, raft *Raft) {
     syncSnapshotToKVServer(snapshot, raft)
 
-    for index := raft.snapshot.LastIncludedIndex + 1; index < raft.currentIndex; index++ {
+    /*for index := raft.snapshot.LastIncludedIndex + 1; index < raft.currentIndex; index++ {
         applyMessage := ApplyMsg{
             CommandValid: false,
             Command:      raft.log[getRealLogIndex(raft, index)].Command,
@@ -473,7 +473,8 @@ func replayDatastore(snapshot []byte, raft *Raft) {
             Replay:       true,
         }
         raft.applyCh <- applyMessage
-    }
+        DPrintf("%d回放index: %d, command: %#v.", raft.me, index, applyMessage.Command)
+    }*/
 }
 
 func syncSnapshotToKVServer(snapshot []byte, raft *Raft) {
