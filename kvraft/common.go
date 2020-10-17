@@ -15,7 +15,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	ID int64
+	ID       int64
+	ClientID int64
 }
 
 type PutAppendReply struct {

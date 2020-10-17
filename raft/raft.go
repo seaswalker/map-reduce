@@ -48,7 +48,6 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-	Replay       bool
 }
 
 // 服务器状态/角色
@@ -273,7 +272,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	if stateSnapshot.LastIncludedIndex >= 0 {
 		snapshot := rf.persister.ReadSnapshot()
-		replayDatastore(snapshot, rf)
+		syncSnapshotToKVServer(snapshot, rf)
 	}
 }
 
@@ -462,21 +461,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshot, reply *InstallSnapshotRep
 		"%d接受leader: %d的install snapshot请求, leader lastIncludedIndex: %d, leader lastIncludedTerm: %d.",
 		rf.me, args.LeaderID, args.LastIncludedIndex, args.LastIncludedTerm,
 	)
-}
-
-func replayDatastore(snapshot []byte, raft *Raft) {
-	syncSnapshotToKVServer(snapshot, raft)
-
-	/*for index := raft.snapshot.LastIncludedIndex + 1; index < raft.currentIndex; index++ {
-	    applyMessage := ApplyMsg{
-	        CommandValid: false,
-	        Command:      raft.log[getRealLogIndex(raft, index)].Command,
-	        CommandIndex: index,
-	        Replay:       true,
-	    }
-	    raft.applyCh <- applyMessage
-	    DPrintf("%d回放index: %d, command: %#v.", raft.me, index, applyMessage.Command)
-	}*/
 }
 
 func syncSnapshotToKVServer(snapshot []byte, raft *Raft) {

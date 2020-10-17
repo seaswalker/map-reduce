@@ -1,11 +1,14 @@
 package shardmaster
 
+import (
+	"sync"
 
-import "raft"
-import "labrpc"
-import "sync"
-import "labgob"
+	"github.com/seaswalker/map-reduce/labrpc"
 
+	"github.com/seaswalker/map-reduce/labgob"
+
+	"github.com/seaswalker/map-reduce/raft"
+)
 
 type ShardMaster struct {
 	mu      sync.Mutex
@@ -18,11 +21,9 @@ type ShardMaster struct {
 	configs []Config // indexed by config num
 }
 
-
 type Op struct {
 	// Your data here.
 }
-
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
@@ -39,7 +40,6 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
 }
-
 
 //
 // the tester calls Kill() when a ShardMaster instance won't
