@@ -1,9 +1,10 @@
 package kvraft
 
 import (
-	"labrpc"
 	"os"
 	"testing"
+
+	"github.com/seaswalker/map-reduce/labrpc"
 
 	// import "log"
 	crand "crypto/rand"
@@ -11,11 +12,12 @@ import (
 	"fmt"
 	"math/big"
 	"math/rand"
-	"raft"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/seaswalker/map-reduce/raft"
 )
 
 func randstring(n int) string {

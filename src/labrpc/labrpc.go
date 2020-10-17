@@ -51,7 +51,6 @@ package labrpc
 
 import (
 	"bytes"
-	"labgob"
 	"log"
 	"math/rand"
 	"reflect"
@@ -59,6 +58,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/seaswalker/map-reduce/labgob"
 )
 
 type reqMsg struct {

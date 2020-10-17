@@ -2,8 +2,9 @@ package kvraft
 
 import (
 	"crypto/rand"
-	"labrpc"
 	"math/big"
+
+	"github.com/seaswalker/map-reduce/labrpc"
 )
 
 type Clerk struct {

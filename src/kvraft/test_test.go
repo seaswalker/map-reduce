@@ -1,7 +1,6 @@
 package kvraft
 
 import (
-	"linearizability"
 	"log"
 	"math/rand"
 	"strconv"
@@ -10,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/seaswalker/map-reduce/linearizability"
 )
 
 // The tester generously allows solutions to complete elections in one second
