@@ -82,16 +82,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer kv.mu.Unlock()
 
 	command := &Op{Operation: "Get", Key: args.Key, RequestID: args.ID}
+
+	kv.logCommitListenerLock.Lock()
 	index, _, success := kv.rf.Start(command)
 	DPrintf("%d向Raft提交Get操作, id: %d, key: %s, 结果: %v.", kv.me, args.ID, args.Key, success)
 
 	if !success {
 		reply.WrongLeader = true
+		kv.logCommitListenerLock.Unlock()
 		return
 	}
 
 	ch := make(chan logCommitListenReply)
 	registerLogCommitListener(kv, index, ch)
+	kv.logCommitListenerLock.Unlock()
 
 	DPrintf("%d注册index: %d的监听器, 请求ID: %d, 开始等待raft事件.", kv.me, index, args.ID)
 
@@ -110,15 +114,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("KVServer: %d收到请求: %d.", kv.me, args.ID)
 
+	// 保证同时只有一个请求在被处理
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	command := &Op{Operation: args.Op, Key: args.Key, Value: args.Value, RequestID: args.ID, ClientID: args.ClientID}
+
+	// 防止在调用start方法和注册监听器之间收到失去leadership消息，导致永远阻塞客户端请求
+	kv.logCommitListenerLock.Lock()
 	index, _, success := kv.rf.Start(command)
 	DPrintf("%d向Raft提交%s请求, id: %d, key: %s, value: %s, 结果: %v.", kv.me, args.Op, args.ID, args.Key, args.Value, success)
 
 	if !success {
 		reply.WrongLeader = true
+		kv.logCommitListenerLock.Unlock()
 		return
 	}
 
@@ -126,6 +135,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	ch := make(chan logCommitListenReply)
 	registerLogCommitListener(kv, index, ch)
+	kv.logCommitListenerLock.Unlock()
 
 	DPrintf("%d注册index: %d的监听器, 请求ID: %d, 开始等待raft事件.", kv.me, index, args.ID)
 
@@ -190,12 +200,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func registerLogCommitListener(kv *KVServer, index int, ch chan logCommitListenReply) {
-	kv.logCommitListenerLock.Lock()
 	if kv.logCommitListener[index] != nil {
 		panic("对index: " + strconv.Itoa(index) + "的监听器已存在!")
 	}
 	kv.logCommitListener[index] = ch
-	kv.logCommitListenerLock.Unlock()
 }
 
 func listenRaftLogCommit(kv *KVServer) {
@@ -228,15 +236,17 @@ func listenRaftLogCommit(kv *KVServer) {
 func handleApplyMessage(kv *KVServer, applyMessage raft.ApplyMsg) {
 	op := applyMessage.Command.(*Op)
 
+	var value string
+
 	resp, ok := kv.duplicatedRequestFilter[op.ClientID]
 	if ok && resp.RequestID == op.RequestID {
 		DPrintf("KVServer: %d发现client: %d的重复请求: %d.", kv.me, op.ClientID, op.RequestID)
-		return
+		value = resp.Resp
+	} else {
+		// update操作不关心返回值，value是空串
+		value = applyCommand(op, kv)
+		kv.duplicatedRequestFilter[op.ClientID] = response{RequestID: op.RequestID, Resp: value}
 	}
-
-	// update操作不关心返回值，value是空串
-	value := applyCommand(op, kv)
-	kv.duplicatedRequestFilter[op.ClientID] = response{RequestID: op.RequestID, Resp: value}
 
 	notifyLogCommit(applyMessage, value, op, kv)
 

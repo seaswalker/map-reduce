@@ -14,11 +14,11 @@ while (( $i < $count ))
 do
     `go test -count=1 -timeout=${timeout}s $(pwd) -run $1 -v > out`
     line=`tail -1 out`
+	let i+=1
 
     if [[ $line == ok* ]]; then
         echo "第${i}次成功了...."
         rm -f out
-	let i+=1
         continue
     fi
     

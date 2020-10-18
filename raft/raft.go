@@ -323,6 +323,7 @@ type InstallSnapshot struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Data              []byte
+	TraceID           string
 }
 
 // InstallSnapshotReply RPC的响应
@@ -458,8 +459,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshot, reply *InstallSnapshotRep
 	syncSnapshotToKVServer(args.Data, rf)
 
 	DPrintf(
-		"%d接受leader: %d的install snapshot请求, leader lastIncludedIndex: %d, leader lastIncludedTerm: %d.",
-		rf.me, args.LeaderID, args.LastIncludedIndex, args.LastIncludedTerm,
+		"%d接受leader: %d的install snapshot请求, leader lastIncludedIndex: %d, leader lastIncludedTerm: %d, traceID: %s.",
+		rf.me, args.LeaderID, args.LastIncludedIndex, args.LastIncludedTerm, args.TraceID,
 	)
 }
 
@@ -484,7 +485,7 @@ func canVoteFor(raft *Raft, args *RequestVoteArgs) (canVote bool, reason string)
 
 	realLastLogEntryIndex := getRealLogIndex(raft, raft.currentIndex-1)
 	var lastLogEntryTerm int
-	if realLastLogEntryIndex < 0 {
+	if realLastLogEntryIndex <= raft.snapshot.LastIncludedIndex {
 		lastLogEntryTerm = raft.snapshot.LastIncludedTerm
 	} else {
 		lastLogEntryTerm = raft.log[realLastLogEntryIndex].Term
@@ -1177,6 +1178,7 @@ func sendInstallSnapshotRPC(raft *Raft, serverID int, traceID string) bool {
 		LastIncludedIndex: raft.snapshot.LastIncludedIndex,
 		LastIncludedTerm:  raft.snapshot.LastIncludedTerm,
 		Data:              raft.persister.ReadSnapshot(),
+		TraceID:           traceID,
 	}
 
 	result := true
@@ -1258,7 +1260,8 @@ func commitLog(raft *Raft) {
 			realIndex := getRealLogIndex(raft, index)
 			// TODO debug
 			if raft.log[realIndex] == nil {
-				panic("error")
+				DPrintf("RealIndex: %d, currentIndex: %d, commitIndex: %d, lastApplied: %d, snapshotTerm: %d, snapshotIndex: %d.", realIndex, raft.currentIndex, raft.commitIndex, raft.lastApplied, raft.snapshot.LastIncludedTerm, raft.snapshot.LastIncludedIndex)
+				panic("commit log错误")
 			}
 
 			applyMessage := ApplyMsg{
